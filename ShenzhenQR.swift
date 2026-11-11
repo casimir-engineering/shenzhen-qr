@@ -3,6 +3,7 @@
 import AppKit
 import AVFoundation
 import Vision
+import VisionKit
 
 // MARK: - What a code holds, and what can be done with it
 
@@ -263,6 +264,32 @@ func detect(_ handler: VNImageRequestHandler, types: [VNBarcodeSymbology]? = nil
     }.sorted { $0.box.width * $0.box.height > $1.box.width * $1.box.height }
 }
 
+/// A line of text read in a picture. Positions as in Detection.
+struct TextLine {
+    let text: String
+    let confidence: Float
+    let corners: [CGPoint]
+}
+
+/// The text Vision reads in the picture (or in `region` of it), line by line in reading order. Languages are found
+/// by themselves (Chinese, English and the others Vision knows).
+func recognizeText(_ handler: VNImageRequestHandler, region: CGRect? = nil) -> [TextLine] {
+    let request = VNRecognizeTextRequest()
+    request.recognitionLevel = .accurate
+    request.usesLanguageCorrection = true
+    request.automaticallyDetectsLanguage = true
+    let roi = region?.intersection(CGRect(x: 0, y: 0, width: 1, height: 1)) ?? CGRect(x: 0, y: 0, width: 1, height: 1)
+    guard roi.width > 0, roi.height > 0 else { return [] }
+    request.regionOfInterest = CGRect(x: roi.minX, y: 1 - roi.maxY, width: roi.width, height: roi.height)
+    do { try handler.perform([request]) } catch { return [] }
+    let top = { (p: CGPoint) in CGPoint(x: roi.minX + p.x * roi.width, y: roi.minY + (1 - p.y) * roi.height) }
+    return (request.results ?? []).compactMap { o in
+        guard let best = o.topCandidates(1).first else { return nil }
+        return TextLine(text: best.string, confidence: best.confidence,
+                        corners: [top(o.topLeft), top(o.topRight), top(o.bottomRight), top(o.bottomLeft)])
+    }
+}
+
 // MARK: - Settings
 
 /// The app's bundle, also when the command line runs through a symlink (Bundle.main then knows no bundle).
@@ -278,15 +305,42 @@ enum Settings {
     /// The app's settings, shared with the command line.
     static let defaults: UserDefaults = Bundle.main.bundleIdentifier != nil ? .standard
         : UserDefaults(suiteName: appBundle.bundleIdentifier ?? "com.intuition.shenzhenqr") ?? .standard
-    static let resolutions: [(key: String, title: String, preset: AVCaptureSession.Preset)] = [
-        ("auto", "Automatic", .high), ("480p", "640 × 480", .vga640x480), ("720p", "1280 × 720", .hd1280x720),
-        ("1080p", "1920 × 1080", .hd1920x1080), ("4k", "3840 × 2160", .hd4K3840x2160),
-    ]
+    /// "auto", or a size such as "1920x1080". Older settings said 480p, 720p, 1080p or 4k.
     static var resolution: String {
-        get { defaults.string(forKey: "resolution").flatMap { k in resolutions.contains { $0.key == k } ? k : nil } ?? "auto" }
+        get { defaults.string(forKey: "resolution").flatMap { parseSize($0) != nil ? $0 : nil } ?? "auto" }
         set { defaults.set(newValue, forKey: "resolution") }
     }
-    static var preset: AVCaptureSession.Preset { resolutions.first { $0.key == resolution }!.preset }
+
+    /// A size from "1920x1080", "1920×1080", "1920 x 1080" or 480p, 720p, 1080p, 4k; nil for "auto" or nonsense.
+    static func parseSize(_ text: String) -> CGSize? {
+        let t = text.lowercased().replacingOccurrences(of: " ", with: "")
+        let named: [String: CGSize] = ["480p": CGSize(width: 640, height: 480), "720p": CGSize(width: 1280, height: 720),
+                                       "1080p": CGSize(width: 1920, height: 1080), "4k": CGSize(width: 3840, height: 2160)]
+        if let n = named[t] { return n }
+        let parts = t.split(whereSeparator: { $0 == "x" || $0 == "×" }).compactMap { Int($0) }
+        guard parts.count == 2, parts[0] > 0, parts[1] > 0 else { return nil }
+        return CGSize(width: parts[0], height: parts[1])
+    }
+    static func sizeText(_ s: CGSize) -> String { "\(Int(s.width)) × \(Int(s.height))" }
+
+    /// The frame sizes a camera can give, biggest first.
+    static func sizes(_ device: AVCaptureDevice) -> [CGSize] {
+        var seen = Set<String>(), out: [CGSize] = []
+        for f in device.formats {
+            let d = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
+            let size = CGSize(width: Int(d.width), height: Int(d.height))
+            if seen.insert(sizeText(size)).inserted { out.append(size) }
+        }
+        return out.sorted { $0.width * $0.height > $1.width * $1.height }
+    }
+
+    /// The camera's format of that size with the highest frame rate.
+    static func format(_ device: AVCaptureDevice, _ size: CGSize) -> AVCaptureDevice.Format? {
+        device.formats.filter {
+            let d = CMVideoFormatDescriptionGetDimensions($0.formatDescription)
+            return Int(d.width) == Int(size.width) && Int(d.height) == Int(size.height)
+        }.max { ($0.videoSupportedFrameRateRanges.map(\.maxFrameRate).max() ?? 0) < ($1.videoSupportedFrameRateRanges.map(\.maxFrameRate).max() ?? 0) }
+    }
     static var maxCores: Int { max(4, ProcessInfo.processInfo.activeProcessorCount) }
     static var cores: Int {
         get { let v = defaults.integer(forKey: "cores"); return v > 0 ? min(v, maxCores) : 4 }
@@ -311,6 +365,8 @@ final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     private let queue = DispatchQueue(label: "capture")
     private let workers = DispatchQueue(label: "decode", qos: .userInitiated, attributes: .concurrent)
     private var inFlight = 0, reportSize = true      // touched on `queue` only
+    private var lastFrame: CVPixelBuffer?             // for a photo; touched on `queue` only
+    var paused = false                                 // a photo is shown: read no codes
     var cores = Settings.cores                       // frames read at the same time
     /// The part of each frame to read, as fractions from its top-left corner (nil: all of it). Given the frame size.
     var region: ((CGSize) -> CGRect?)?
@@ -325,7 +381,8 @@ final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
                                          mediaType: .video, position: .unspecified).devices
     }
 
-    func use(_ device: AVCaptureDevice, preset: AVCaptureSession.Preset) {
+    /// `resolution`: "auto" or a size the camera has (Settings.sizes); another size counts as "auto".
+    func use(_ device: AVCaptureDevice, resolution: String) {
         queue.async { [self] in
             session.beginConfiguration()
             session.inputs.forEach { session.removeInput($0) }
@@ -336,7 +393,12 @@ final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
                 if session.canAddOutput(out) { session.addOutput(out) }
             }
             if let input = try? AVCaptureDeviceInput(device: device), session.canAddInput(input) { session.addInput(input) }
-            session.sessionPreset = session.canSetSessionPreset(preset) ? preset : .high
+            session.sessionPreset = .high
+            if let size = Settings.parseSize(resolution), let format = Settings.format(device, size),
+               (try? device.lockForConfiguration()) != nil {
+                device.activeFormat = format          // the session follows the device's format from here
+                device.unlockForConfiguration()
+            }
             session.commitConfiguration()
             reportSize = true
             if !session.isRunning { session.startRunning() }
@@ -347,7 +409,8 @@ final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
         guard let pixels = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let size = CGSize(width: CVPixelBufferGetWidth(pixels), height: CVPixelBufferGetHeight(pixels))
         if reportSize { reportSize = false; DispatchQueue.main.async { self.onSize?(size) } }
-        guard inFlight < max(1, cores) else { return }   // every worker busy: skip this frame
+        lastFrame = pixels
+        guard !paused, inFlight < max(1, cores) else { return }   // a photo is shown, or every worker is busy
         inFlight += 1
         let types = self.types, part = region?(size)
         workers.async { [self] in
@@ -356,6 +419,31 @@ final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
             if !found.isEmpty { DispatchQueue.main.async { self.onCodes?(found, size) } }
         }
     }
+}
+
+extension Scanner {
+    /// The latest camera frame as a picture, `region` of it only (fractions from the top-left corner).
+    func photo(region: CGRect?) -> CGImage? { photo { _ in region }?.image }
+
+    /// The same, with the region chosen from the frame's size; also returns the region and the frame size.
+    func photo(region: (CGSize) -> CGRect?) -> (image: CGImage, region: CGRect?, size: CGSize)? {
+        var frame: CVPixelBuffer?
+        queue.sync { frame = lastFrame }
+        guard let frame else { return nil }
+        let size = CGSize(width: CVPixelBufferGetWidth(frame), height: CVPixelBufferGetHeight(frame))
+        let part = region(size)
+        return cgImage(CIImage(cvPixelBuffer: frame), region: part).map { ($0, part, size) }
+    }
+}
+
+/// A picture, or the `region` of it (fractions from its top-left corner).
+func cgImage(_ image: CIImage, region: CGRect?) -> CGImage? {
+    var rect = image.extent
+    if let r = region?.intersection(CGRect(x: 0, y: 0, width: 1, height: 1)), !r.isEmpty {
+        rect = CGRect(x: rect.minX + r.minX * rect.width, y: rect.minY + (1 - r.maxY) * rect.height,
+                      width: r.width * rect.width, height: r.height * rect.height).integral
+    }
+    return CIContext().createCGImage(image, from: rect)
 }
 
 /// Outlines each code where it was read, over the camera picture (or a still picture), shown at aspect fit.
@@ -569,6 +657,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
     var lastCode = "", lastCodeAt = Date.distantPast
     var cameras: [AVCaptureDevice] = []
     var markerTimer: Timer?
+    let photoButton = NSButton(title: "Photo", image: NSImage(systemSymbolName: "camera", accessibilityDescription: nil)!,
+                               target: nil, action: nil)
+    var photoView: NSImageView?, photoOverlay: ImageAnalysisOverlayView?
     var settingsWindow: SettingsWindow?
 
     func applicationDidFinishLaunching(_ n: Notification) {
@@ -632,7 +723,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
         let bottom = NSStackView(views: [buttons, NSView(), copyButton])
         bottom.orientation = .horizontal
 
-        let top = NSStackView(views: [NSTextField(labelWithString: "Camera:"), cameraMenu, NSView(), resolutionMenu])
+        photoButton.target = self; photoButton.action = #selector(togglePhoto)
+        photoButton.imagePosition = .imageLeading
+        photoButton.toolTip = "Take a photo and read the text in it. You can then select text on the photo."
+        let top = NSStackView(views: [NSTextField(labelWithString: "Camera:"), cameraMenu, NSView(), resolutionMenu, photoButton])
         top.orientation = .horizontal
         let header = NSStackView(views: [kindLabel, NSView(), statusLabel])
         header.orientation = .horizontal
@@ -695,6 +789,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
         guard !cameras.isEmpty else { statusLabel.stringValue = "No camera found"; return }
         let index = cameras.firstIndex { $0.uniqueID == Settings.camera } ?? 0
         cameraMenu.selectItem(at: index)
+        frameSize = nil
+        refreshResolutionMenu()
         startCamera()
     }
 
@@ -702,7 +798,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
         let i = cameraMenu.indexOfSelectedItem
         guard cameras.indices.contains(i) else { return }
         scanner.cores = Settings.cores
-        scanner.use(cameras[i], preset: Settings.preset)
+        scanner.use(cameras[i], resolution: Settings.resolution)
         preview.markers.mirrored = preview.layerPreview.connection?.isVideoMirrored ?? false
     }
 
@@ -710,6 +806,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
         let i = cameraMenu.indexOfSelectedItem
         guard cameras.indices.contains(i) else { return }
         Settings.camera = cameras[i].uniqueID
+        frameSize = nil
+        refreshResolutionMenu()
+        settingsWindow?.reload()
         startCamera()
     }
 
@@ -719,26 +818,93 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
         if !cameras.isEmpty { frameSize = nil; refreshResolutionMenu(); startCamera() }
     }
 
-    /// The resolutions, the chosen one with the size the camera actually gives when that differs from its name.
+    var currentCamera: AVCaptureDevice? {
+        let i = cameraMenu.indexOfSelectedItem
+        return cameras.indices.contains(i) ? cameras[i] : nil
+    }
+
+    /// Automatic, then every size the chosen camera has. The setting's index among them (Automatic when this camera
+    /// doesn't have that size).
+    func resolutionChoices() -> (choices: [(key: String, title: String)], selected: Int) {
+        let sizes = currentCamera.map(Settings.sizes) ?? []
+        let choices = [("auto", "Automatic")] + sizes.map { ("\(Int($0.width))x\(Int($0.height))", Settings.sizeText($0)) }
+        let wanted = offscreen ? nil : Settings.parseSize(Settings.resolution)   // the screenshot shows the default
+        let selected = wanted.flatMap { w in sizes.firstIndex(of: w).map { $0 + 1 } } ?? 0
+        return (choices, selected)
+    }
+
     func refreshResolutionMenu() {
+        let (choices, selected) = resolutionChoices()
         resolutionMenu.removeAllItems()
-        let chosen = offscreen ? "auto" : Settings.resolution   // the screenshot shows the default
-        for r in Settings.resolutions {
-            var title = r.title
-            if r.key == chosen, let size = frameSize {
-                let actual = "\(Int(size.width)) × \(Int(size.height))"
-                if r.key == "auto" { title = "Automatic · \(actual)" }
-                else if actual != r.title { title = "\(r.title) (camera gives \(actual))" }
-            }
-            resolutionMenu.addItem(withTitle: title)
+        for (i, c) in choices.enumerated() {
+            // Automatic says what the camera gives.
+            resolutionMenu.addItem(withTitle: i == 0 && selected == 0 ? frameSize.map { "Automatic · " + Settings.sizeText($0) } ?? c.title : c.title)
         }
-        resolutionMenu.selectItem(at: Settings.resolutions.firstIndex { $0.key == chosen } ?? 0)
+        resolutionMenu.selectItem(at: selected)
     }
 
     @objc func resolutionChosen() {
-        Settings.resolution = Settings.resolutions[resolutionMenu.indexOfSelectedItem].key
+        Settings.resolution = resolutionChoices().choices[resolutionMenu.indexOfSelectedItem].key
         settingsWindow?.reload()
         settingsChanged()
+    }
+
+    /// Photo: freezes what the camera shows (the zoomed part only) and reads its text; the text on the photo can then
+    /// be selected as in Preview. Again: back to the camera.
+    @MainActor @objc func togglePhoto() {
+        if photoView != nil { closePhoto(); return }
+        guard let image = scanner.photo(region: zoomRegion(Settings.zoom)) else { setStatus("No picture from the camera yet"); return }
+        showPhoto(image)
+    }
+
+    @MainActor func showPhoto(_ image: CGImage) {
+        scanner.paused = true
+        markerTimer?.invalidate()
+        preview.markers.detections = []
+        preview.markers.isHidden = true
+        preview.zoomBar.isHidden = true
+        preview.layerPreview.isHidden = true
+        let view = NSImageView(image: NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height)))
+        view.imageScaling = .scaleProportionallyUpOrDown
+        view.frame = preview.bounds
+        view.autoresizingMask = [.width, .height]
+        preview.addSubview(view, positioned: .below, relativeTo: preview.markers)
+        let overlay = ImageAnalysisOverlayView()
+        overlay.trackingImageView = view
+        overlay.preferredInteractionTypes = .automatic
+        overlay.frame = preview.bounds
+        overlay.autoresizingMask = [.width, .height]
+        preview.addSubview(overlay, positioned: .above, relativeTo: view)
+        photoView = view; photoOverlay = overlay
+        photoButton.title = "Back to Camera"
+        photoButton.image = NSImage(systemSymbolName: "video", accessibilityDescription: nil)
+        setStatus("Reading the text…")
+        Task { @MainActor in
+            let config = ImageAnalyzer.Configuration([.text, .machineReadableCode])
+            let analysis = try? await ImageAnalyzer().analyze(image, orientation: .up, configuration: config)
+            guard let analysis, self.photoOverlay === overlay else { return }
+            overlay.analysis = analysis
+            let text = analysis.transcript
+            self.lastCode = ""
+            self.textView.string = text
+            let kind = Payload.kind(text)
+            self.kindLabel.stringValue = text.isEmpty ? "" : kind == "Text" ? "Text in the photo" : "Text in the photo · \(kind)"
+            self.setStatus(text.isEmpty ? "No text found in the photo" : "Select text on the photo, or edit it below")
+            self.refreshActions()
+        }
+    }
+
+    func closePhoto() {
+        photoOverlay?.removeFromSuperview(); photoView?.removeFromSuperview()
+        photoOverlay = nil; photoView = nil
+        preview.layerPreview.isHidden = false
+        preview.markers.isHidden = false
+        preview.zoomBar.isHidden = false
+        photoButton.title = "Photo"
+        photoButton.image = NSImage(systemSymbolName: "camera", accessibilityDescription: nil)
+        lastCode = ""; lastCodeAt = .distantPast
+        setStatus("")
+        scanner.paused = false
     }
 
     func setZoom(_ z: Double) {
@@ -763,6 +929,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
     }
 
     func found(_ codes: [Detection], size: CGSize) {
+        if photoView != nil { return }
         preview.markers.imageSize = size
         preview.markers.mirrored = preview.layerPreview.connection?.isVideoMirrored ?? false
         preview.markers.detections = codes
@@ -828,8 +995,6 @@ final class SettingsWindow: NSWindowController {
                          backing: .buffered, defer: false)
         w.title = "ShenzhenQR Settings"
         self.init(window: w)
-        resolution.addItems(withTitles: Settings.resolutions.map(\.title))
-        resolution.selectItem(at: Settings.resolutions.firstIndex { $0.key == Settings.resolution } ?? 0)
         resolution.target = self; resolution.action = #selector(changed)
         cores.addItems(withTitles: (1...Settings.maxCores).map(String.init))
         cores.selectItem(at: Settings.cores - 1)
@@ -857,15 +1022,21 @@ final class SettingsWindow: NSWindowController {
         ])
         w.contentView = content
         w.center()
+        reload()
     }
 
+    /// The sizes of the camera chosen in the window.
     func reload() {
-        resolution.selectItem(at: Settings.resolutions.firstIndex { $0.key == Settings.resolution } ?? 0)
+        let (choices, selected) = AppDelegate.shared?.resolutionChoices() ?? ([("auto", "Automatic")], 0)
+        resolution.removeAllItems()
+        resolution.addItems(withTitles: choices.map(\.title))
+        resolution.selectItem(at: selected)
         cores.selectItem(at: Settings.cores - 1)
     }
 
     @objc func changed() {
-        Settings.resolution = Settings.resolutions[resolution.indexOfSelectedItem].key
+        let choices = AppDelegate.shared?.resolutionChoices().choices ?? [("auto", "Automatic")]
+        Settings.resolution = choices[max(0, resolution.indexOfSelectedItem)].key
         Settings.cores = cores.indexOfSelectedItem + 1
         AppDelegate.shared?.settingsChanged()
     }
@@ -875,7 +1046,7 @@ final class SettingsWindow: NSWindowController {
 
 enum CLI {
     static var active = false
-    static let commands: Set<String> = ["scan", "camera", "cameras", "parse", "run", "settings", "types", "help",
+    static let commands: Set<String> = ["scan", "camera", "cameras", "photo", "ocr", "parse", "run", "settings", "types", "help",
                                         "--help", "-h", "--version", "--screenshot"]
 
     static let help = """
@@ -884,12 +1055,14 @@ enum CLI {
     Usage:
       shenzhenqr scan [options] <picture>...  Read the codes in pictures (PNG, JPEG, HEIC, TIFF…; - reads standard input)
       shenzhenqr camera [options]             Read codes from a camera and print each new one, until Ctrl-C
-      shenzhenqr cameras                      List the cameras
+      shenzhenqr cameras                      List the cameras and the picture sizes each one has
+      shenzhenqr photo [options] <file>       Take a photo with a camera and save it (.png or .jpg); --ocr prints its text
+      shenzhenqr ocr [options] <picture>...   Read the text in pictures, line by line (- reads standard input)
       shenzhenqr parse <text>                 Say what a code's text is and what can be done with it
       shenzhenqr run <text> [<action>]        Do one of those things: a number or the start of its name
                                               (shenzhenqr run "WIFI:S:Lab;P:pw;;" join)
       shenzhenqr settings [<name> <value>]    Show the settings, or change one (shared with the app):
-                                                resolution  auto, 480p, 720p, 1080p or 4k
+                                                resolution  auto or a size the camera has, such as 1920x1080
                                                 cores       frames or pictures read at the same time (default 4)
                                                 zoom        the window's zoom into the middle, 1 to 5 (camera uses it too)
                                                 camera      a camera's name or ID, or auto
@@ -907,7 +1080,8 @@ enum CLI {
       --zoom <factor>     Read only the middle, 1/factor of the width and height (2.5 reads the middle 40%)
       camera only:
       --camera <name|id>  The camera to use (default: the one chosen in the app)
-      --resolution <r>    auto, 480p, 720p, 1080p or 4k (default: the settings)
+      --resolution <r>    auto or a size the camera has, such as 1920x1080 (default: the settings)
+      --ocr               photo only: print the text in the photo
       --once              Stop after the first code
       --timeout <s>       Give up after this many seconds
                           (the camera reads the middle at the app's zoom unless --zoom or --region says otherwise)
@@ -921,7 +1095,7 @@ enum CLI {
     """
 
     struct Options {
-        var json = false, text = false, first = false, copy = false, once = false
+        var json = false, text = false, first = false, copy = false, once = false, ocr = false
         var types: [VNBarcodeSymbology]?
         var cores = Settings.cores
         var camera: String?, resolution: String?
@@ -959,6 +1133,7 @@ enum CLI {
             case "--first": o.first = true
             case "--copy": o.copy = true
             case "--once": o.once = true
+            case "--ocr": o.ocr = true
             case "--cores":
                 guard let n = Int(value(a)), n >= 1 else { fail("--cores needs a number of 1 or more") }
                 o.cores = n
@@ -981,7 +1156,7 @@ enum CLI {
                 o.region = parts
             case "--resolution":
                 let r = value(a).lowercased()
-                guard Settings.resolutions.contains(where: { $0.key == r }) else { fail("--resolution is auto, 480p, 720p, 1080p or 4k") }
+                guard r == "auto" || Settings.parseSize(r) != nil else { fail("--resolution is auto or a size such as 1920x1080 (shenzhenqr cameras lists them)") }
                 o.resolution = r
             case "--timeout":
                 guard let t = Double(value(a)), t > 0 else { fail("--timeout needs a number of seconds") }
@@ -997,6 +1172,32 @@ enum CLI {
 
     static func jsonString(_ v: Any) -> String {
         String(decoding: try! JSONSerialization.data(withJSONObject: v, options: [.sortedKeys, .withoutEscapingSlashes]), as: UTF8.self)
+    }
+
+    /// Where something is, in pixels from the picture's top-left corner: its box and corners, and the part read.
+    static func geometry(_ corners: [CGPoint], size: CGSize, part: CGRect?) -> [String: Any] {
+        let num = { (v: Double, digits: Int) in Decimal(string: String(format: "%.\(digits)f", v))! }
+        let px = { (p: CGPoint) -> [Decimal] in [num(p.x * size.width, 1), num(p.y * size.height, 1)] }
+        let xs = corners.map(\.x), ys = corners.map(\.y)
+        let b = CGRect(x: xs.min()!, y: ys.min()!, width: xs.max()! - xs.min()!, height: ys.max()! - ys.min()!)
+        let rect = { (r: CGRect) -> [String: Int] in
+            ["x": Int((r.minX * size.width).rounded()), "y": Int((r.minY * size.height).rounded()),
+             "width": Int((r.width * size.width).rounded()), "height": Int((r.height * size.height).rounded())]
+        }
+        return [
+            "image": ["width": Int(size.width), "height": Int(size.height)],
+            "box": rect(b),
+            "corners": ["top_left": px(corners[0]), "top_right": px(corners[1]),
+                        "bottom_right": px(corners[2]), "bottom_left": px(corners[3])],
+            "region": part.map { rect($0) as Any } ?? NSNull(),
+        ]
+    }
+
+    static func lineRecord(_ l: TextLine, size: CGSize, source: String, part: CGRect?) -> [String: Any] {
+        var r = geometry(l.corners, size: size, part: part)
+        r["source"] = source; r["text"] = l.text
+        r["confidence"] = Decimal(string: String(format: "%.3f", Double(l.confidence)))!
+        return r
     }
 
     static func record(_ d: Detection, size: CGSize, source: String, part: CGRect?) -> [String: Any] {
@@ -1069,7 +1270,10 @@ enum CLI {
     static func listCameras() -> Never {
         let cams = Scanner.cameras()
         if cams.isEmpty { fail("No camera found", 3) }
-        for c in cams { print("\(c.localizedName)\t\(c.uniqueID)\(c.uniqueID == Settings.camera ? "\t(chosen in the app)" : "")") }
+        for c in cams {
+            print("\(c.localizedName)\t\(c.uniqueID)\(c.uniqueID == Settings.camera ? "\t(chosen in the app)" : "")")
+            print("  " + Settings.sizes(c).map { "\(Int($0.width))x\(Int($0.height))" }.joined(separator: " "))
+        }
         exit(0)
     }
 
@@ -1082,10 +1286,88 @@ enum CLI {
             ?? failed("No camera matches “\(wanted)”. shenzhenqr cameras lists them.", 3)
     }
 
-    static func camera(_ o: Options) -> Never {
+    static func ocr(_ o: Options) -> Never {
+        guard !o.rest.isEmpty else { fail("Which pictures? shenzhenqr ocr <picture>...") }
+        var any = false
+        for path in o.rest {
+            guard let image = loadImage(path) else { FileHandle.standardError.write("\(path): can’t be opened as a picture\n".data(using: .utf8)!); continue }
+            let part = o.part(image.extent.size, defaultZoom: 1)
+            let lines = recognizeText(VNImageRequestHandler(ciImage: image, options: [:]), region: part)
+            if lines.isEmpty, !o.json { FileHandle.standardError.write("\(path): no text found\n".data(using: .utf8)!) }
+            if !lines.isEmpty { any = true }
+            printLines(lines, size: image.extent.size, source: path == "-" ? "stdin" : path, part: part, o: o)
+        }
+        exit(any ? 0 : 1)
+    }
+
+    static func printLines(_ lines: [TextLine], size: CGSize, source: String, part: CGRect?, o: Options) {
+        for l in lines {
+            print(o.json ? jsonString(lineRecord(l, size: size, source: source, part: part)) : l.text)
+        }
+        if o.copy, !lines.isEmpty { Payload.copy(lines.map(\.text).joined(separator: "\n")) }
+    }
+
+    /// Opens the camera with the options' resolution, sets the scanner up with `configure`, and waits; the
+    /// callbacks exit. --timeout gives up.
+    static func withCamera(_ o: Options, configure: @escaping (AVCaptureDevice, Scanner) -> Void) -> Never {
         let device = pickCamera(o.camera)
+        let resolution = o.resolution ?? Settings.resolution
+        if let r = o.resolution, let size = Settings.parseSize(r), !Settings.sizes(device).contains(size) {
+            fail("\(device.localizedName) has no \(Settings.sizeText(size)) picture. It has: "
+                 + Settings.sizes(device).map(Settings.sizeText).joined(separator: ", "))
+        }
         let start = {
             let scanner = Scanner()
+            configure(device, scanner)
+            scanner.use(device, resolution: resolution)
+            objc_setAssociatedObject(device, "scanner", scanner, .OBJC_ASSOCIATION_RETAIN)
+        }
+        if let t = o.timeout { DispatchQueue.main.asyncAfter(deadline: .now() + t) { fail("Nothing within \(Int(t)) s", 1) } }
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .authorized: start()
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .video) { ok in
+                DispatchQueue.main.async {
+                    if ok { start() } else { fail("The camera isn’t allowed for this terminal app", 3) }
+                }
+            }
+        default:
+            fail("The camera isn’t allowed for this terminal app. Allow it in System Settings › Privacy & Security › Camera.", 3)
+        }
+        dispatchMain()
+    }
+
+    /// A photo from the camera, saved as PNG or JPEG (by the name's extension); --ocr prints its text.
+    static func photo(_ o: Options) -> Never {
+        guard let out = o.rest.first else { fail("Where to save it? shenzhenqr photo <file.png|file.jpg>") }
+        withCamera(o) { device, scanner in
+            scanner.paused = true
+            // Give the camera a moment to set its exposure, then take the latest frame.
+            func take(_ tries: Int) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + (tries == 0 ? 1.0 : 0.2)) {
+                    guard let shot = scanner.photo(region: { o.part($0, defaultZoom: Settings.zoom) }) else {
+                        if tries > 25 { fail("No picture from \(device.localizedName)", 3) }
+                        take(tries + 1); return
+                    }
+                    let rep = NSBitmapImageRep(cgImage: shot.image)
+                    let jpeg = ["jpg", "jpeg"].contains(URL(fileURLWithPath: out).pathExtension.lowercased())
+                    let data = rep.representation(using: jpeg ? .jpeg : .png, properties: jpeg ? [.compressionFactor: 0.9] : [:])!
+                    do { try data.write(to: URL(fileURLWithPath: out)) } catch { fail("Couldn’t save \(out): \(error.localizedDescription)") }
+                    FileHandle.standardError.write("Saved \(out) (\(shot.image.width) × \(shot.image.height))\n".data(using: .utf8)!)
+                    if o.ocr {
+                        let size = CGSize(width: shot.image.width, height: shot.image.height)
+                        let lines = recognizeText(VNImageRequestHandler(cgImage: shot.image, options: [:]))
+                        printLines(lines, size: size, source: out, part: nil, o: o)
+                    }
+                    exit(0)
+                }
+            }
+            take(0)
+        }
+    }
+
+    static func camera(_ o: Options) -> Never {
+        withCamera(o) { device, scanner in
             scanner.cores = o.cores
             scanner.types = o.types
             scanner.region = { size in o.part(size, defaultZoom: Settings.zoom) }
@@ -1102,24 +1384,8 @@ enum CLI {
                     if o.once { exit(0) }
                 }
             }
-            let preset = Settings.resolutions.first { $0.key == (o.resolution ?? Settings.resolution) }!.preset
-            scanner.use(device, preset: preset)
-            objc_setAssociatedObject(device, "scanner", scanner, .OBJC_ASSOCIATION_RETAIN)
             FileHandle.standardError.write("Reading codes from \(device.localizedName)… (Ctrl-C to stop)\n".data(using: .utf8)!)
         }
-        if let t = o.timeout { DispatchQueue.main.asyncAfter(deadline: .now() + t) { fail("No code within \(Int(t)) s", 1) } }
-        switch AVCaptureDevice.authorizationStatus(for: .video) {
-        case .authorized: start()
-        case .notDetermined:
-            AVCaptureDevice.requestAccess(for: .video) { ok in
-                DispatchQueue.main.async {
-                    if ok { start() } else { fail("The camera isn’t allowed for this terminal app", 3) }
-                }
-            }
-        default:
-            fail("The camera isn’t allowed for this terminal app. Allow it in System Settings › Privacy & Security › Camera.", 3)
-        }
-        dispatchMain()
     }
 
     static func textArgument(_ o: Options) -> String {
@@ -1159,9 +1425,12 @@ enum CLI {
 
     static func settings(_ o: Options) -> Never {
         if o.rest.isEmpty {
-            let r = Settings.resolutions.first { $0.key == Settings.resolution }!
             let cam = Scanner.cameras().first { $0.uniqueID == Settings.camera }
-            print("resolution\t\(r.key)\t\(r.title)")
+            let note = Settings.parseSize(Settings.resolution).flatMap { size -> String? in
+                guard let cam, !Settings.sizes(cam).contains(size) else { return nil }
+                return "\t(\(cam.localizedName) has no \(Settings.sizeText(size)): it uses Automatic)"
+            } ?? ""
+            print("resolution\t\(Settings.resolution)\(note)")
             print("cores\t\(Settings.cores)")
             print("zoom\t\(Settings.zoom)")
             print("camera\t\(Settings.camera ?? "auto")\t\(cam?.localizedName ?? "the first camera found")")
@@ -1171,8 +1440,8 @@ enum CLI {
         let value = o.rest[1]
         switch o.rest[0] {
         case "resolution":
-            guard Settings.resolutions.contains(where: { $0.key == value.lowercased() }) else { fail("resolution is auto, 480p, 720p, 1080p or 4k") }
-            Settings.resolution = value.lowercased()
+            guard value.lowercased() == "auto" || Settings.parseSize(value) != nil else { fail("resolution is auto or a size such as 1920x1080 (shenzhenqr cameras lists them)") }
+            Settings.resolution = Settings.parseSize(value).map { "\(Int($0.width))x\(Int($0.height))" } ?? "auto"
         case "cores":
             guard let n = Int(value), (1...Settings.maxCores).contains(n) else { fail("cores is a number from 1 to \(Settings.maxCores)") }
             Settings.cores = n
@@ -1198,6 +1467,8 @@ enum CLI {
         case "scan": scan(o)
         case "camera": camera(o)
         case "cameras": listCameras()
+        case "photo": photo(o)
+        case "ocr": ocr(o)
         case "parse": parseText(o)
         case "run": runAction(o)
         case "settings": settings(o)
@@ -1214,6 +1485,24 @@ enum CLI {
                 view.layoutSubtreeIfNeeded(); view.displayIfNeeded()
                 let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds)!
                 view.cacheDisplay(in: view.bounds, to: rep)
+                try! rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: args[2]))
+                exit(0)
+            }
+            if args.count > 4, args[4] == "photo" {
+                // The Photo view: the picture as if just taken, its text read, drawn once reading is done.
+                let d = AppDelegate()
+                d.offscreen = true
+                NSApp.appearance = NSAppearance(named: .aqua)
+                d.buildWindow()
+                d.window.setContentSize(NSSize(width: 560, height: 640))
+                let ci = CIImage(contentsOf: URL(fileURLWithPath: args[3]))!
+                MainActor.assumeIsolated { d.showPhoto(cgImage(ci, region: nil)!) }
+                let deadline = Date().addingTimeInterval(20)
+                while d.statusLabel.stringValue == "Reading the text…", Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.1)) }
+                let content = d.window.contentView!
+                content.layoutSubtreeIfNeeded(); content.displayIfNeeded()
+                let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds)!
+                content.cacheDisplay(in: content.bounds, to: rep)
                 try! rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: args[2]))
                 exit(0)
             }

@@ -8,9 +8,10 @@ Apple Silicon · macOS 14+ · Signed and notarized
 
 ![ShenzhenQR reading a Wi-Fi QR code](docs/screenshot.png)
 
-- **Any camera.** Pick it from the menu at the top; ShenzhenQR remembers your choice and notices cameras being plugged in or removed. The menu beside it sets the resolution and shows what the camera gives.
+- **Any camera.** Pick it from the menu at the top; ShenzhenQR remembers your choice and notices cameras being plugged in or removed. The menu beside it lists the picture sizes that camera has.
 - **Zoom for small codes.** Double-click the picture to zoom 2.5× into the middle, and again to zoom out, or use the zoom bar at the bottom of the picture. Only the middle is read then, closer up, so smaller codes are found.
 - **Every common code.** QR, Micro QR, Aztec, Data Matrix, PDF417, EAN and UPC, Code 128, 39 and 93, ITF, Codabar and GS1 DataBar.
+- **Photo and text.** **Photo** freezes the picture and reads the text in it, Chinese included: select text right on the photo, as in Preview, or edit all of it in the field below. **Back to Camera** returns.
 - **See where it is.** A green outline marks each code where it was read. With several in view, click one to use it.
 - **Settings** (⌘,): the camera resolution, and how many processor cores read frames at the same time (4 unless you change it).
 - **The text, ready to use.** What the code holds appears in a field you can select and edit. **Copy** puts it on the clipboard.
@@ -39,9 +40,12 @@ desk.jpg: QR code · Wi-Fi network · at x 513, y 167, 301 × 283 px of 1280 × 
 
 - `shenzhenqr scan [options] <picture>...` reads every code in pictures (`-` reads standard input).
 - `shenzhenqr camera [options]` prints each new code a camera sees, until Ctrl-C; `--once` stops at the first.
-- `shenzhenqr cameras`, `shenzhenqr types` list the cameras and the code types.
+- `shenzhenqr ocr [options] <picture>...` reads the text in pictures, line by line; `--json` adds each line's position.
+- `shenzhenqr photo [options] <file.png|file.jpg>` takes a photo with a camera; `--ocr` also prints its text.
+- `shenzhenqr cameras`, `shenzhenqr types` list the cameras with the picture sizes each one has, and the code types.
 - `shenzhenqr parse <text>` says what a code's text is and what can be done with it; `shenzhenqr run <text> join` does it.
-- `shenzhenqr settings [<name> <value>]` shows or changes the app's settings: `resolution`, `cores`, `zoom`, `camera`.
+- `shenzhenqr settings [<name> <value>]` shows or changes the app's settings: `resolution` (`auto` or a size such as
+  `1920x1080`), `cores`, `zoom`, `camera`.
 
 `--json` gives one JSON object per code with its type, text, kind, actions and position: `box` (x, y, width,
 height) and `corners`, in pixels from the picture's top-left corner. `--text` gives only the text, `--first` only the
