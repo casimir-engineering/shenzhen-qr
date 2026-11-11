@@ -745,7 +745,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
         buildWindow()
         Updater.shared.start()
         scanner.onCodes = { [weak self] codes, size in self?.found(codes, size: size) }
-        scanner.onSize = { [weak self] size in self?.frameSize = size; self?.refreshResolutionMenu() }
+        scanner.onSize = { [weak self] size in self?.frameSize = size; self?.refreshResolutionMenu(); self?.fitToPicture(size) }
         scanner.region = { _ in zoomRegion(Settings.zoom) }
         preview.markers.onPick = { [weak self] d in self?.show(d) }
         preview.markers.onDoubleClick = { [weak self] in self?.setZoom(Settings.zoom > 1.05 ? 1 : 2.5) }
@@ -861,6 +861,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
     }
 
     @objc func tabChosen() { showTab(tabs.selectedSegment) }
+
+    /// The window's height set so the camera picture fills the preview, without black bars; the width and the top
+    /// edge stay where they are.
+    func fitToPicture(_ size: CGSize) {
+        guard !offscreen, size.width > 0, !scanView.isHidden, let window, !window.inLiveResize else { return }
+        window.contentView?.layoutSubtreeIfNeeded()
+        let want = (preview.frame.width * size.height / size.width).rounded()
+        let delta = want - preview.frame.height
+        guard abs(delta) > 1 else { return }
+        var frame = window.frame
+        frame.size.height += delta
+        frame.origin.y -= delta
+        if let screen = window.screen?.visibleFrame, frame.minY < screen.minY {   // keep it on the screen
+            frame.origin.y = screen.minY
+            frame.size.height = min(frame.height, screen.height)
+        }
+        window.setFrame(frame, display: true, animate: false)
+    }
 
     /// Scan runs the camera; Create stops it, so the camera light goes off while making codes.
     func showTab(_ index: Int) {

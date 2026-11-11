@@ -2,17 +2,29 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>CFBundleExecutable</key><string>ShenzhenQR</string>
-	<key>CFBundleIdentifier</key><string>com.intuition.shenzhenqr</string>
-	<key>CFBundleName</key><string>ShenzhenQR</string>
-	<key>CFBundleDisplayName</key><string>ShenzhenQR</string>
-	<key>CFBundlePackageType</key><string>APPL</string>
-	<key>CFBundleShortVersionString</key><string>1.5</string>
-	<key>CFBundleVersion</key><string>7</string>
-	<key>CFBundleIconFile</key><string>AppIcon</string>
-	<key>LSMinimumSystemVersion</key><string>14.0</string>
-	<key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
-	<key>NSHighResolutionCapable</key><true/>
-	<key>NSCameraUsageDescription</key><string>ShenzhenQR reads QR codes and barcodes from the camera you choose. Nothing is recorded or sent anywhere.</string>
+	<key>CFBundleDisplayName</key>
+	<string>ShenzhenQR</string>
+	<key>CFBundleExecutable</key>
+	<string>ShenzhenQR</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.intuition.shenzhenqr</string>
+	<key>CFBundleName</key>
+	<string>ShenzhenQR</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.5.1</string>
+	<key>CFBundleVersion</key>
+	<string>8</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.utilities</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>NSCameraUsageDescription</key>
+	<string>ShenzhenQR reads QR codes and barcodes from the camera you choose. Nothing is recorded or sent anywhere.</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
 </dict>
 </plist>
