@@ -1,6 +1,6 @@
 # ShenzhenQR
 
-A tiny Mac app that reads QR codes and barcodes from any camera: the built-in one, a USB webcam, a virtual camera or an iPhone.
+A tiny Mac app that reads QR codes and barcodes from any camera (the built-in one, a USB webcam, a virtual camera or an iPhone) and makes them.
 
 <a href="https://github.com/casimir-engineering/shenzhen-qr/releases/latest/download/ShenzhenQR.dmg"><img src="https://img.shields.io/badge/Download%20for%20macOS-Apple%20Silicon-2ea44f?style=for-the-badge&logo=apple&logoColor=white" alt="Download for macOS (Apple Silicon)" height="46"></a>
 
@@ -17,6 +17,8 @@ Apple Silicon · macOS 14+ · Signed and notarized
 - **Settings** (⌘,): the camera resolution, and how many processor cores read frames at the same time (4 unless you change it).
 - **The text, ready to use.** What the code holds appears in a field you can select and edit. **Copy** puts it on the clipboard.
 - **The right next step.** Depending on the code: **Join** a Wi-Fi network (or copy its password), **Open in Browser**, **Add to Contacts**, **Add to Calendar**, **Write Email**, **Call**, **Send Message** or **Show in Maps**. Buttons follow your edits.
+- **Make codes.** The **Create** tab at the top makes a QR code, Data Matrix, Aztec code, PDF417, Code 128, EAN-13, UPC-A or EAN-8 as a crisp PNG, saved in Downloads unless you choose another folder. Type and content are all it needs; **Advanced** has error correction, quiet zone, Data Matrix shape, bar height, the digits under EAN and UPC barcodes, colors, a transparent background and the file name, each with the standard value until you change it.
+- **Updates.** ShenzhenQR checks for a new version once a day and asks before installing it; **Check for Updates…** in the app menu checks now.
 
 ## Install
 
@@ -45,6 +47,11 @@ desk.jpg: QR code · Wi-Fi network · at x 513, y 167, 301 × 283 px of 1280 × 
 - `shenzhenqr photo [options] <file.png|file.jpg>` takes a photo with a camera; `--ocr` also prints its text.
 - `shenzhenqr cameras`, `shenzhenqr types` list the cameras with the picture sizes each one has, and the code types.
 - `shenzhenqr parse <text>` says what a code's text is and what can be done with it; `shenzhenqr run <text> join` does it.
+- `shenzhenqr make [options] <text>` makes a code as a PNG in Downloads: `--type qr` (default), `datamatrix`, `aztec`,
+  `pdf417`, `code128`, `ean13`, `upca` or `ean8`; `--out` another file or folder (`-` writes the PNG to standard
+  output); `--size`, `--margin`, `--correction`, `--color`, `--background` (`transparent` too), `--shape`, `--height`,
+  `--no-digits`. It prints where it saved the file.
+- `shenzhenqr update` installs the newest version; `shenzhenqr update --check` only says whether there is one.
 - `shenzhenqr settings [<name> <value>]` shows or changes the app's settings: `resolution` (`auto` or a size such as
   `1920x1080`), `cores`, `zoom`, `camera`.
 

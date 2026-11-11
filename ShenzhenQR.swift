@@ -4,6 +4,9 @@ import AppKit
 import AVFoundation
 import Vision
 import VisionKit
+import Security
+import CryptoKit
+import CoreImage.CIFilterBuiltins
 
 // MARK: - What a code holds, and what can be done with it
 
@@ -482,6 +485,8 @@ final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
 }
 
 extension Scanner {
+    func stop() { queue.async { if self.session.isRunning { self.session.stopRunning() } } }
+
     /// The latest camera frame as a picture, `region` of it only (fractions from the top-left corner).
     func photo(region: CGRect?) -> CGImage? { photo { _ in region }?.image }
 
@@ -713,7 +718,7 @@ enum Installer {
 
 // MARK: - Window
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NSToolbarDelegate {
     static weak var shared: AppDelegate?
     let scanner = Scanner()
     var window: NSWindow!
@@ -738,6 +743,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
         if Installer.offerMove() { return }
         Installer.ejectInstallerDisk()
         buildWindow()
+        Updater.shared.start()
         scanner.onCodes = { [weak self] codes, size in self?.found(codes, size: size) }
         scanner.onSize = { [weak self] size in self?.frameSize = size; self?.refreshResolutionMenu() }
         scanner.region = { _ in zoomRegion(Settings.zoom) }
@@ -812,13 +818,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
         preview.heightAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
         scroll.heightAnchor.constraint(equalToConstant: 110).isActive = true
         preview.setContentHuggingPriority(.defaultLow, for: .vertical)
-        window.contentView = stack
+        // Two tabs in the top bar: Scan (the camera) and Create (making codes).
+        let container = NSView()
+        createView = CreateView()
+        for v in [stack, createView!] as [NSView] {
+            v.translatesAutoresizingMaskIntoConstraints = false
+            container.addSubview(v)
+            NSLayoutConstraint.activate([
+                v.topAnchor.constraint(equalTo: container.topAnchor), v.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+                v.leadingAnchor.constraint(equalTo: container.leadingAnchor), v.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            ])
+        }
+        scanView = stack
+        window.contentView = container
+        let toolbar = NSToolbar(identifier: "main")
+        toolbar.delegate = self
+        toolbar.centeredItemIdentifiers = [Self.tabsItem]
+        toolbar.displayMode = .iconOnly
+        window.toolbar = toolbar
+        window.toolbarStyle = .unified
+        window.titleVisibility = .hidden
+        showTab(offscreen ? 0 : Settings.defaults.integer(forKey: "tab"))
         if offscreen { return }
         if !window.setFrameUsingName("main") { window.center() }
         window.makeKeyAndOrderFront(nil)
     }
 
     var offscreen = false
+    var scanView: NSView!, createView: CreateView!
+    let tabs = NSSegmentedControl(labels: ["Scan", "Create"], trackingMode: .selectOne, target: nil, action: nil)
+    static let tabsItem = NSToolbarItem.Identifier("tabs")
+
+    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { [Self.tabsItem] }
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { [Self.tabsItem] }
+    func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier id: NSToolbarItem.Identifier, willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
+        let item = NSToolbarItem(itemIdentifier: id)
+        tabs.target = self; tabs.action = #selector(tabChosen)
+        tabs.segmentStyle = .automatic
+        item.view = tabs
+        item.label = "Scan or Create"
+        return item
+    }
+
+    @objc func tabChosen() { showTab(tabs.selectedSegment) }
+
+    /// Scan runs the camera; Create stops it, so the camera light goes off while making codes.
+    func showTab(_ index: Int) {
+        let create = index == 1
+        tabs.selectedSegment = create ? 1 : 0
+        scanView.isHidden = create
+        createView.isHidden = !create
+        if !offscreen { Settings.defaults.set(create ? 1 : 0, forKey: "tab") }
+        if create { scanner.stop() } else if !cameras.isEmpty, photoView == nil { startCamera() }
+        window.makeFirstResponder(create ? createView.textView : nil)
+    }
 
     /// The README's screenshot: the window as it looks after reading `scene`, a picture standing in for the camera.
     /// Drawn off screen; no camera, no clipboard.
@@ -862,10 +915,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
         cameraMenu.selectItem(at: index)
         frameSize = nil
         refreshResolutionMenu()
-        startCamera()
+        if !scanView.isHidden { startCamera() }
     }
 
     func startCamera() {
+        guard scanView?.isHidden != true else { return }   // the Create tab keeps the camera off
         let i = cameraMenu.indexOfSelectedItem
         guard cameras.indices.contains(i) else { return }
         scanner.cores = Settings.cores
@@ -1190,7 +1244,7 @@ final class SettingsWindow: NSWindowController {
 
 enum CLI {
     static var active = false
-    static let commands: Set<String> = ["scan", "camera", "cameras", "photo", "ocr", "parse", "run", "settings", "types", "help",
+    static let commands: Set<String> = ["scan", "camera", "cameras", "photo", "ocr", "make", "create", "parse", "run", "settings", "types", "update", "--verify-update", "help",
                                         "--help", "-h", "--version", "--screenshot"]
 
     static let help = """
@@ -1202,6 +1256,16 @@ enum CLI {
       shenzhenqr cameras                      List the cameras and the picture sizes each one has
       shenzhenqr photo [options] <file>       Take a photo with a camera and save it (.png or .jpg); --ocr prints its text
       shenzhenqr ocr [options] <picture>...   Read the text in pictures, line by line (- reads standard input)
+      shenzhenqr make [options] <text>        Make a code as a PNG, saved in Downloads (- reads the text from standard input)
+                                                --type <t>        qr (default), datamatrix, aztec, pdf417, code128, ean13, upca, ean8
+                                                --out <file|dir>  where to save it (- writes the PNG to standard output)
+                                                --size <px>       width in pixels (default 1024), whole pixels per module
+                                                --margin <n>      quiet zone in modules (default: the type's standard)
+                                                --correction <c>  qr: L, M (default), Q, H; aztec: a percentage (23);
+                                                                  pdf417: auto or 0 to 8
+                                                --color <#RRGGBB>, --background <#RRGGBB|transparent>
+                                                --shape square|rectangle (datamatrix), --height <modules> (barcodes),
+                                                --no-digits (ean13, upca, ean8: no digits under the bars), --copy
       shenzhenqr parse <text>                 Say what a code's text is and what can be done with it
       shenzhenqr run <text> [<action>]        Do one of those things: a number or the start of its name
                                               (shenzhenqr run "WIFI:S:Lab;P:pw;;" join)
@@ -1211,6 +1275,7 @@ enum CLI {
                                                 zoom        the window's zoom into the middle, 1 to 5 (camera uses it too)
                                                 camera      a camera's name or ID, or auto
       shenzhenqr types                        List the code types
+      shenzhenqr update [--check]             Install the newest version of ShenzhenQR, or only say if there is one
 
     Options:
       --json              One JSON object per code, on one line each
@@ -1248,6 +1313,7 @@ enum CLI {
         var camera: String?, resolution: String?
         var timeout: Double?
         var zoom: Double?
+        var make = MakeOptions(), out: String?
         var region: [Double]?           // x, y, width, height: pixels, or fractions when all are 1 or less
         var rest: [String] = []
 
@@ -1292,6 +1358,34 @@ enum CLI {
                     return known[key] ?? failed("Unknown code type “\(name)”. shenzhenqr types lists them.")
                 }
             case "--camera": o.camera = value(a)
+            case "--type":
+                let t = value(a).lowercased().replacingOccurrences(of: "-", with: "").replacingOccurrences(of: " ", with: "")
+                o.make.kind = CodeKind(rawValue: t == "dm" ? "datamatrix" : t)
+                    ?? failed("--type is " + CodeKind.allCases.map(\.rawValue).joined(separator: ", "))
+            case "--out": o.out = value(a)
+            case "--size":
+                guard let n = Int(value(a)), (16...20000).contains(n) else { fail("--size is a width in pixels, 16 to 20000") }
+                o.make.size = n
+            case "--margin":
+                guard let n = Int(value(a)), (0...100).contains(n) else { fail("--margin is a number of modules, 0 to 100") }
+                o.make.margin = n
+            case "--correction":
+                let c = value(a).uppercased()
+                o.make.correction = c == "AUTO" ? "auto" : c
+            case "--color": o.make.foreground = parseColor(value(a)) ?? failed("--color is #RRGGBB, such as #000000")
+            case "--background":
+                let v = value(a)
+                o.make.background = v.lowercased() == "transparent" ? nil : parseColor(v) ?? failed("--background is #RRGGBB or transparent")
+            case "--shape":
+                switch value(a).lowercased() {
+                case "square": o.make.shape = .square
+                case "rectangle", "rect": o.make.shape = .rectangle
+                default: fail("--shape is square or rectangle")
+                }
+            case "--height":
+                guard let n = Int(value(a)), n > 0 else { fail("--height is a bar height in modules") }
+                o.make.barHeight = n
+            case "--no-digits": o.make.label = false
             case "--zoom":
                 guard let z = Double(value(a)), z >= 1, z <= 20 else { fail("--zoom needs a factor from 1 to 20, such as 2.5") }
                 o.zoom = z
@@ -1603,6 +1697,87 @@ enum CLI {
         exit(0)
     }
 
+    /// update --check: says whether a newer version is out. update: installs it in place of this app.
+    static func update(_ o: Options) -> Never {
+        let checkOnly = o.rest.first == "--check" || o.rest.first == "check"
+        let release: Update.Release?
+        do { release = try Update.latestRelease(conditional: false) } catch { fail(String(describing: error), 1) }
+        guard let release, Update.compare(release.version, Update.currentVersion) > 0 else {
+            if o.json { print(jsonString(["installed": Update.currentVersion, "available": NSNull()])) }
+            else { print("ShenzhenQR \(Update.currentVersion) is the latest version.") }
+            exit(0)
+        }
+        if checkOnly {
+            if o.json { print(jsonString(["installed": Update.currentVersion, "available": release.version])) }
+            else { print("ShenzhenQR \(release.version) is available — you have \(Update.currentVersion). shenzhenqr update installs it.") }
+            exit(0)
+        }
+        if Update.cantUpdateHere { fail("ShenzhenQR runs from a disk image here. Move it to your Applications folder first.", 1) }
+        let staging: URL
+        do { staging = try Update.stagingFolder() } catch { fail(String(describing: error), 1) }
+        defer { try? FileManager.default.removeItem(at: staging) }
+        FileHandle.standardError.write("Downloading ShenzhenQR \(release.version)…\n".data(using: .utf8)!)
+        var request = URLRequest(url: release.url, timeoutInterval: 60)
+        request.setValue("ShenzhenQR/\(Update.currentVersion) (macOS; +https://github.com/\(Update.repo))", forHTTPHeaderField: "User-Agent")
+        let (data, response, error) = URLSession(configuration: .ephemeral).syncData(request)
+        guard error == nil, (response as? HTTPURLResponse)?.statusCode == 200, let data, data.count <= Update.maxDownload
+        else { fail("The update could not be downloaded.", 1) }
+        let dmg = staging.appendingPathComponent(Update.asset)
+        do { try data.write(to: dmg) } catch { fail("The downloaded update could not be saved.", 1) }
+        let app: URL
+        do { app = try Update.prepare(dmg: dmg, release: release, staging: staging) } catch { fail(String(describing: error), 1) }
+        // Swap: a running ShenzhenQR keeps the version it started with until it reopens.
+        let target = appBundle.bundleURL, old = URL(fileURLWithPath: target.path + ".old")
+        try? FileManager.default.removeItem(at: old)
+        guard rename(target.path, old.path) == 0 else { fail("ShenzhenQR couldn’t be replaced in \(target.deletingLastPathComponent().path).", 1) }
+        guard rename(app.path, target.path) == 0, Update.verify(target, notarized: false, app: true) == nil else {
+            try? FileManager.default.removeItem(at: target); _ = rename(old.path, target.path)
+            fail("The update could not be installed; ShenzhenQR \(Update.currentVersion) is kept.", 1)
+        }
+        LSRegisterURL(target as CFURL, true)
+        let running = NSRunningApplication.runningApplications(withBundleIdentifier: Update.bundleID).contains { $0.processIdentifier != getpid() }
+        print("Installed ShenzhenQR \(release.version)." + (running ? " The open ShenzhenQR window uses it once you quit and reopen it." : ""))
+        exit(0)
+    }
+
+    /// make: a code as a PNG, saved in Downloads unless --out says otherwise (- writes it to standard output).
+    static func make(_ o: Options) -> Never {
+        var m = o.make
+        let text = o.rest.first == "-" ? String(decoding: FileHandle.standardInput.readDataToEndOfFile(), as: UTF8.self)
+                                         .trimmingCharacters(in: .newlines) : o.rest.joined(separator: " ")
+        guard !text.isEmpty else { fail("What should the code hold? shenzhenqr make [--type qr] <text>") }
+        m.text = text
+        if let c = m.correction, !m.kind.corrections.isEmpty, !m.kind.corrections.contains(where: { $0.key == c }) {
+            fail("--correction for \(m.kind.title) is " + m.kind.corrections.map(\.key).joined(separator: ", "))
+        }
+        let rendered: (image: CGImage, text: String)
+        do { rendered = try renderCode(m) } catch { fail(makeProblem(error, kind: m.kind, shape: m.shape), 1) }
+        let data = pngData(rendered.image)
+        if o.out == "-" { FileHandle.standardOutput.write(data); exit(0) }
+        let url: URL
+        if let out = o.out {
+            var u = URL(fileURLWithPath: (out as NSString).expandingTildeInPath)
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: u.path, isDirectory: &isDir), isDir.boolValue { u = freeFileName(defaultFileBase(m.kind), in: u) }
+            else if u.pathExtension.lowercased() != "png" { u.appendPathExtension("png") }
+            url = u
+        } else {
+            url = freeFileName(defaultFileBase(m.kind), in: downloadsFolder)
+        }
+        do { try data.write(to: url) } catch { fail("Couldn’t save \(url.path): \(error.localizedDescription)", 1) }
+        if o.copy {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setData(data, forType: .png)
+        }
+        if o.json {
+            print(jsonString(["file": url.path, "type": m.kind.rawValue, "text": rendered.text,
+                              "width": rendered.image.width, "height": rendered.image.height]))
+        } else {
+            print(url.path)
+        }
+        exit(0)
+    }
+
     static func types() -> Never {
         for s in VNDetectBarcodesRequest().supportedSymbologiesOrEmpty { print("\(symbologyKey(s))\t\(symbologyName(s))") }
         exit(0)
@@ -1610,11 +1785,29 @@ enum CLI {
 
     static func main(_ args: [String]) -> Never {
         active = true
+        if args[1] == "--verify-update", args.count == 4 {
+            // Test: runs the updater's checks on a local disk image, as if it were release `args[3]`.
+            let dmg = URL(fileURLWithPath: args[2])
+            let size = (try? FileManager.default.attributesOfItem(atPath: dmg.path)[.size] as? Int) ?? 0
+            let r = Update.Release(tag: "v" + args[3], version: args[3], url: dmg, size: size, digest: nil, notes: "")
+            let staging = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try? FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: staging) }
+            do { let app = try Update.prepare(dmg: dmg, release: r, staging: staging); print("passes: \(app.lastPathComponent)") }
+            catch { print("refused: \(error)") }
+            exit(0)
+        }
+        if args[1] == "update" {
+            // update takes its own words: update, update --check, --json
+            var o = Options(); o.json = args.contains("--json"); o.rest = args.dropFirst(2).filter { $0 != "--json" }
+            update(o)
+        }
         let o = parse(args.dropFirst(2))
         switch args[1] {
         case "scan": scan(o)
         case "camera": camera(o)
         case "cameras": listCameras()
+        case "make", "create": make(o)
         case "photo": photo(o)
         case "ocr": ocr(o)
         case "parse": parseText(o)
@@ -1627,6 +1820,24 @@ enum CLI {
         case "--screenshot":
             guard args.count >= 4 else { fail("--screenshot <out.png> <picture|settings> [zoom]") }
             _ = NSApplication.shared
+            if args[3] == "create" {
+                // The Create tab, Advanced open when asked.
+                NSApp.appearance = NSAppearance(named: .aqua)
+                let d = AppDelegate(); d.offscreen = true
+                d.buildWindow(); d.window.setContentSize(NSSize(width: 560, height: 640))
+                d.showTab(1)
+                if args.count > 4 {
+                    d.createView.advancedButton.state = .on; d.createView.toggleAdvanced()
+                    if let k = CodeKind(rawValue: args[4]) { d.createView.kindMenu.selectItem(at: CodeKind.allCases.firstIndex(of: k)!); d.createView.kindChanged() }
+                    if args.count > 5 { d.createView.textView.string = args[5]; d.createView.changed() }
+                }
+                let view = d.window.contentView!
+                view.layoutSubtreeIfNeeded(); view.displayIfNeeded()
+                let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds)!
+                view.cacheDisplay(in: view.bounds, to: rep)
+                try! rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: args[2]))
+                exit(0)
+            }
             if args[3] == "settings" {
                 NSApp.appearance = NSAppearance(named: .aqua)
                 let view = SettingsWindow().window!.contentView!
@@ -1668,9 +1879,1115 @@ extension VNDetectBarcodesRequest {
     var supportedSymbologiesOrEmpty: [VNBarcodeSymbology] { (try? supportedSymbologies()) ?? [] }
 }
 
+// MARK: - Making codes
+
+// Data Matrix and EAN/UPC encoders (checked by reading every symbol size back with Vision).
+// Barcode encoders: Data Matrix ECC 200 and EAN-13 / UPC-A / EAN-8. Pure Swift, no imports needed.
+
+// MARK: - Shared types
+
+/// A 2D symbol as modules, row 0 at the top; true = dark. No quiet zone.
+struct ModuleMatrix {
+    let width: Int
+    let height: Int
+    let dark: [Bool] // row-major
+    subscript(x: Int, y: Int) -> Bool { dark[y * width + x] }
+}
+
+/// `.automatic` picks the smallest symbol (fewest modules) of either shape; ties go to square.
+enum DataMatrixShape { case square, rectangle, automatic }
+enum EncoderError: Error { case tooLong, invalidCharacters(String), invalidCheckDigit(expected: Int) }
+
+// MARK: - Data Matrix ECC 200 (ISO/IEC 16022)
+
+/// One ECC 200 symbol size (ISO/IEC 16022, table 7).
+private struct DMSymbol {
+    let rows, cols: Int             // whole symbol, in modules
+    let regionRows, regionCols: Int // one data region, without its finder/timing border
+    let dataCodewords, eccCodewords, blocks: Int
+    init(_ r: Int, _ c: Int, _ rr: Int, _ rc: Int, _ d: Int, _ e: Int, _ b: Int) {
+        (rows, cols, regionRows, regionCols, dataCodewords, eccCodewords, blocks) = (r, c, rr, rc, d, e, b)
+    }
+}
+
+private let dmSymbols: [DMSymbol] = [
+    // square: one region
+    .init(10, 10, 8, 8, 3, 5, 1), .init(12, 12, 10, 10, 5, 7, 1), .init(14, 14, 12, 12, 8, 10, 1),
+    .init(16, 16, 14, 14, 12, 12, 1), .init(18, 18, 16, 16, 18, 14, 1), .init(20, 20, 18, 18, 22, 18, 1),
+    .init(22, 22, 20, 20, 30, 20, 1), .init(24, 24, 22, 22, 36, 24, 1), .init(26, 26, 24, 24, 44, 28, 1),
+    // square: 2x2 regions
+    .init(32, 32, 14, 14, 62, 36, 1), .init(36, 36, 16, 16, 86, 42, 1), .init(40, 40, 18, 18, 114, 48, 1),
+    .init(44, 44, 20, 20, 144, 56, 1), .init(48, 48, 22, 22, 174, 68, 1), .init(52, 52, 24, 24, 204, 84, 2),
+    // square: 4x4 regions
+    .init(64, 64, 14, 14, 280, 112, 2), .init(72, 72, 16, 16, 368, 144, 4), .init(80, 80, 18, 18, 456, 192, 4),
+    .init(88, 88, 20, 20, 576, 224, 4), .init(96, 96, 22, 22, 696, 272, 4), .init(104, 104, 24, 24, 816, 336, 6),
+    // square: 6x6 regions
+    .init(120, 120, 18, 18, 1050, 408, 6), .init(132, 132, 20, 20, 1304, 496, 8), .init(144, 144, 22, 22, 1558, 620, 10),
+    // rectangular
+    .init(8, 18, 6, 16, 5, 7, 1), .init(8, 32, 6, 14, 10, 11, 1), .init(12, 26, 10, 24, 16, 14, 1),
+    .init(12, 36, 10, 16, 22, 18, 1), .init(16, 36, 14, 16, 32, 24, 1), .init(16, 48, 14, 22, 49, 28, 1),
+]
+
+/// ASCII encodation: digit pairs → 130+nn, ASCII c → c+1, bytes ≥128 → Upper Shift (235) then byte−127.
+private func dmASCII(_ bytes: [UInt8]) -> [Int] {
+    func isDigit(_ b: UInt8) -> Bool { b >= 48 && b <= 57 }
+    var out: [Int] = []
+    var i = 0
+    while i < bytes.count {
+        let b = bytes[i]
+        if i + 1 < bytes.count, isDigit(b), isDigit(bytes[i + 1]) {
+            out.append(130 + Int(b - 48) * 10 + Int(bytes[i + 1] - 48)); i += 2
+        } else if b < 128 {
+            out.append(Int(b) + 1); i += 1
+        } else {
+            out += [235, Int(b) - 127]; i += 1
+        }
+    }
+    return out
+}
+
+// GF(256) with the Data Matrix field polynomial x^8+x^5+x^3+x^2+1 (0x12D).
+private let gfExp: [Int] = {
+    var e = [Int](repeating: 0, count: 512), x = 1
+    for i in 0..<255 { e[i] = x; e[i + 255] = x; x <<= 1; if x & 0x100 != 0 { x ^= 0x12D } }
+    return e
+}()
+private let gfLog: [Int] = {
+    var l = [Int](repeating: 0, count: 256)
+    for i in 0..<255 { l[gfExp[i]] = i }
+    return l
+}()
+private func gfMul(_ a: Int, _ b: Int) -> Int { a == 0 || b == 0 ? 0 : gfExp[gfLog[a] + gfLog[b]] }
+
+/// Reed–Solomon check codewords: remainder of data(x)·xⁿ divided by the generator
+/// g(x) = (x − α¹)(x − α²)…(x − αⁿ), computed with a shift register.
+private func rsCheck(_ data: [Int], _ n: Int) -> [Int] {
+    var g = [1] // generator coefficients, highest power first
+    for i in 1...n {
+        var next = g + [0]
+        for j in 1..<next.count { next[j] ^= gfMul(g[j - 1], gfExp[i]) }
+        g = next
+    }
+    var rem = [Int](repeating: 0, count: n)
+    for d in data {
+        let f = d ^ rem[0]
+        rem.removeFirst(); rem.append(0)
+        for j in 0..<n { rem[j] ^= gfMul(f, g[j + 1]) }
+    }
+    return rem
+}
+
+/// ECC 200 module placement (ISO/IEC 16022 Annex F) into the mapping matrix (all data regions joined,
+/// borders removed). Each codeword is an 8-module "utah" shape; shapes are laid along alternating diagonal
+/// sweeps (up-right, then down-left), four special corner shapes handle sizes the sweep can't tile, and
+/// modules that fall off one edge wrap around to the opposite edge.
+private func dmPlace(_ cw: [Int], rows nrow: Int, cols ncol: Int) -> [Bool] {
+    var cell = [Int8](repeating: -1, count: nrow * ncol) // -1 = not placed yet
+    func module(_ r: Int, _ c: Int, _ k: Int, _ bit: Int) { // bit 0 = most significant
+        var r = r, c = c
+        if r < 0 { r += nrow; c += 4 - ((nrow + 4) % 8) }
+        if c < 0 { c += ncol; r += 4 - ((ncol + 4) % 8) }
+        cell[r * ncol + c] = Int8((cw[k] >> (7 - bit)) & 1)
+    }
+    func utah(_ r: Int, _ c: Int, _ k: Int) {
+        let p = [(r - 2, c - 2), (r - 2, c - 1), (r - 1, c - 2), (r - 1, c - 1), (r - 1, c), (r, c - 2), (r, c - 1), (r, c)]
+        for (i, (pr, pc)) in p.enumerated() { module(pr, pc, k, i) }
+    }
+    func corner(_ k: Int, _ p: [(Int, Int)]) { for (i, (pr, pc)) in p.enumerated() { module(pr, pc, k, i) } }
+    let (R, C) = (nrow, ncol)
+    var k = 0, r = 4, c = 0
+    repeat {
+        if r == R && c == 0 {
+            corner(k, [(R-1, 0), (R-1, 1), (R-1, 2), (0, C-2), (0, C-1), (1, C-1), (2, C-1), (3, C-1)]); k += 1
+        }
+        if r == R - 2 && c == 0 && C % 4 != 0 {
+            corner(k, [(R-3, 0), (R-2, 0), (R-1, 0), (0, C-4), (0, C-3), (0, C-2), (0, C-1), (1, C-1)]); k += 1
+        }
+        if r == R - 2 && c == 0 && C % 8 == 4 {
+            corner(k, [(R-3, 0), (R-2, 0), (R-1, 0), (0, C-2), (0, C-1), (1, C-1), (2, C-1), (3, C-1)]); k += 1
+        }
+        if r == R + 4 && c == 2 && C % 8 == 0 {
+            corner(k, [(R-1, 0), (R-1, C-1), (0, C-3), (0, C-2), (0, C-1), (1, C-3), (1, C-2), (1, C-1)]); k += 1
+        }
+        repeat { // sweep up-right
+            if r < R && c >= 0 && cell[r * C + c] < 0 { utah(r, c, k); k += 1 }
+            r -= 2; c += 2
+        } while r >= 0 && c < C
+        r += 1; c += 3
+        repeat { // sweep down-left
+            if r >= 0 && c < C && cell[r * C + c] < 0 { utah(r, c, k); k += 1 }
+            r += 2; c -= 2
+        } while r < R && c >= 0
+        r += 3; c += 1
+    } while r < R || c < C
+    // Sizes that leave the bottom-right 2x2 unused get a fixed diagonal pattern there.
+    if cell[R * C - 1] < 0 { cell[R * C - 1] = 1; cell[R * C - C - 2] = 1 }
+    return cell.map { $0 == 1 }
+}
+
+/// Data Matrix ECC 200 (ISO/IEC 16022). Bytes: the text's UTF-8 bytes; values above 127 use the Upper Shift (235) codeword.
+/// ASCII encodation with digit-pair compression. Picks the smallest symbol of the requested shape that fits.
+func encodeDataMatrix(_ text: String, shape: DataMatrixShape) throws -> ModuleMatrix {
+    // Readers take Data Matrix bytes as Latin-1: use it when the text fits (é, ü…), UTF-8 bytes otherwise.
+    let latin1 = text.unicodeScalars.allSatisfy { $0.value <= 0xFF }
+    var cw = dmASCII(latin1 ? text.unicodeScalars.map { UInt8($0.value) } : Array(text.utf8))
+    let allowed = dmSymbols.filter {
+        switch shape {
+        case .square: return $0.rows == $0.cols
+        case .rectangle: return $0.rows != $0.cols
+        case .automatic: return true
+        }
+    }
+    guard let sym = allowed.filter({ $0.dataCodewords >= cw.count })
+        .min(by: { $0.rows * $0.cols < $1.rows * $1.cols }) else { throw EncoderError.tooLong }
+
+    // Pad: first 129, then 129 + a pseudo-random value from the 1-based position (253-state randomising).
+    if cw.count < sym.dataCodewords { cw.append(129) }
+    while cw.count < sym.dataCodewords {
+        let v = 129 + (149 * (cw.count + 1)) % 253 + 1
+        cw.append(v > 254 ? v - 254 : v)
+    }
+
+    // Interleaving: the whole stream (data, then check codewords) is dealt round-robin, so position p
+    // belongs to block p % blocks. Data codeword i goes to block i % blocks; block b's j-th check codeword
+    // lands at the j-th position after the data whose p % blocks == b. Only 144x144 (1558 data codewords,
+    // 10 blocks: 8 of 156 + 2 of 155) has data not a multiple of the block count, so its check codewords
+    // start with block 8, not block 0.
+    let nb = sym.blocks, eccPer = sym.eccCodewords / nb, nd = cw.count
+    cw += [Int](repeating: 0, count: sym.eccCodewords)
+    for b in 0..<nb {
+        let check = rsCheck(stride(from: b, to: nd, by: nb).map { cw[$0] }, eccPer)
+        for (j, v) in check.enumerated() { cw[nd + j * nb + (b - nd % nb + nb) % nb] = v }
+    }
+
+    let (rr, rc) = (sym.regionRows, sym.regionCols)
+    let mapCols = sym.cols / (rc + 2) * rc
+    let bits = dmPlace(cw, rows: sym.rows / (rr + 2) * rr, cols: mapCols)
+
+    // Lay the mapping matrix into regions, each framed by its finder (solid left and bottom edges)
+    // and timing pattern (alternating top and right edges).
+    var dark = [Bool](repeating: false, count: sym.rows * sym.cols)
+    for y in 0..<sym.rows {
+        for x in 0..<sym.cols {
+            let (ry, iy, rx, ix) = (y / (rr + 2), y % (rr + 2), x / (rc + 2), x % (rc + 2))
+            let v: Bool
+            if ix == 0 || iy == rr + 1 { v = true }
+            else if iy == 0 { v = x % 2 == 0 }
+            else if ix == rc + 1 { v = y % 2 == 1 }
+            else { v = bits[(ry * rr + iy - 1) * mapCols + rx * rc + ix - 1] }
+            dark[y * sym.cols + x] = v
+        }
+    }
+    return ModuleMatrix(width: sym.cols, height: sym.rows, dark: dark)
+}
+
+// MARK: - EAN-13 / UPC-A / EAN-8
+
+/// Bars as a Bool per module (true = bar), guard patterns included, no quiet zones.
+/// `guardModules` are the modules drawn longer when digits are printed under the code: the start, centre
+/// and end guards, plus (UPC-A only) the first and last digit, which UPC-A prints full height.
+struct LinearBarcode { let text: String; let modules: [Bool]; let guardModules: Set<Int> }
+enum LinearKind { case ean13, upcA, ean8 }
+
+private let eanL = [0x0D, 0x19, 0x13, 0x3D, 0x23, 0x31, 0x2F, 0x3B, 0x37, 0x0B] // 7-bit L (odd) codes
+/// EAN-13 first digit → which of the 6 left digits use G (even) codes, MSB = first digit.
+private let eanParity = [0x00, 0x0B, 0x0D, 0x0E, 0x13, 0x19, 0x1C, 0x15, 0x16, 0x1A]
+
+/// EAN-13 / UPC-A / EAN-8. `digits`: 12 or 13 for EAN-13, 11 or 12 for UPC-A, 7 or 8 for EAN-8; with the
+/// longer length the last digit is checked. `text` is the full digit string with check digit
+/// (12 digits for UPC-A). Non-digits → invalidCharacters(those characters); too many digits → tooLong;
+/// too few → invalidCharacters(the input).
+func encodeEAN(_ digits: String, kind: LinearKind) throws -> LinearBarcode {
+    let bad = digits.filter { !($0.asciiValue.map { (48...57).contains($0) } ?? false) }
+    if !bad.isEmpty { throw EncoderError.invalidCharacters(String(bad)) }
+    let d = digits.map { Int($0.asciiValue! - 48) }
+    let full = kind == .ean13 ? 13 : kind == .upcA ? 12 : 8
+    if d.count > full { throw EncoderError.tooLong }
+    if d.count < full - 1 { throw EncoderError.invalidCharacters(digits) }
+
+    // Check digit: weights 3,1,3,… from the rightmost data digit.
+    let body = d.count == full ? Array(d.dropLast()) : d
+    let sum = body.reversed().enumerated().reduce(0) { $0 + $1.element * ($1.offset % 2 == 0 ? 3 : 1) }
+    let check = (10 - sum % 10) % 10
+    if d.count == full && d.last != check { throw EncoderError.invalidCheckDigit(expected: check) }
+    let all = body + [check]
+    let sym = kind == .upcA ? [0] + all : all // UPC-A is EAN-13 with a leading 0
+
+    var m: [Bool] = []
+    var guards = Set<Int>()
+    func add(_ bits: Int, _ n: Int, isGuard: Bool = false) {
+        if isGuard { guards.formUnion(m.count..<(m.count + n)) }
+        for i in (0..<n).reversed() { m.append((bits >> i) & 1 == 1) }
+    }
+    func rCode(_ v: Int) -> Int { ~eanL[v] & 0x7F }
+    func gCode(_ v: Int) -> Int { // G = R code read backwards
+        let r = rCode(v)
+        return (0..<7).reduce(0) { $0 | ((r >> $1) & 1) << (6 - $1) }
+    }
+
+    let (left, right): (ArraySlice<Int>, ArraySlice<Int>)
+    let parity: Int
+    if kind == .ean8 { (left, right, parity) = (sym[0..<4], sym[4..<8], 0) }
+    else { (left, right, parity) = (sym[1..<7], sym[7..<13], eanParity[sym[0]]) } // first digit is implied by parity
+    add(0b101, 3, isGuard: true)
+    for (i, v) in left.enumerated() { add((parity >> (left.count - 1 - i)) & 1 == 1 ? gCode(v) : eanL[v], 7) }
+    add(0b01010, 5, isGuard: true)
+    for v in right { add(rCode(v), 7) }
+    add(0b101, 3, isGuard: true)
+    if kind == .upcA { guards.formUnion(3..<10); guards.formUnion(85..<92) }
+    return LinearBarcode(text: all.map(String.init).joined(), modules: m, guardModules: guards)
+}
+
+
+enum CodeKind: String, CaseIterable {
+    case qr, datamatrix, aztec, pdf417, code128, ean13, upca, ean8
+    var title: String {
+        switch self {
+        case .qr: "QR code"; case .datamatrix: "Data Matrix"; case .aztec: "Aztec code"; case .pdf417: "PDF417"
+        case .code128: "Code 128"; case .ean13: "EAN-13"; case .upca: "UPC-A"; case .ean8: "EAN-8"
+        }
+    }
+    var linear: Bool { [.code128, .ean13, .upca, .ean8].contains(self) }
+    var retail: Bool { [.ean13, .upca, .ean8].contains(self) }
+    /// The standard quiet zone, in modules: left and right (and top and bottom for 2D codes).
+    var standardMargin: (left: Int, right: Int) {
+        switch self {
+        case .qr, .datamatrix: (4, 4); case .aztec, .pdf417: (2, 2); case .code128: (10, 10)
+        case .ean13: (11, 7); case .upca: (9, 9); case .ean8: (7, 7)
+        }
+    }
+    /// What can be put in it, said when it can't.
+    var hint: String {
+        switch self {
+        case .ean13: "EAN-13 takes 12 digits (the 13th, the check digit, is added) or 13 digits"
+        case .upca: "UPC-A takes 11 digits (the 12th, the check digit, is added) or 12 digits"
+        case .ean8: "EAN-8 takes 7 digits (the 8th, the check digit, is added) or 8 digits"
+        case .code128: "Code 128 takes letters, digits and symbols from the ASCII set, not accents or other scripts"
+        default: "This is too much text for a \(title)"
+        }
+    }
+    var corrections: [(key: String, title: String)] {
+        switch self {
+        case .qr: [("L", "Low (7%)"), ("M", "Medium (15%)"), ("Q", "Quartile (25%)"), ("H", "High (30%)")]
+        case .aztec: [10, 23, 33, 50, 75].map { ("\($0)", "\($0)%") }
+        case .pdf417: [("auto", "Automatic")] + (0...8).map { ("\($0)", "Level \($0)") }
+        default: []
+        }
+    }
+    var standardCorrection: String { switch self { case .qr: "M"; case .aztec: "23"; case .pdf417: "auto"; default: "" } }
+}
+
+struct MakeOptions {
+    var kind = CodeKind.qr
+    var text = ""
+    var size = 1024                 // width in pixels, rounded down to whole pixels per module
+    var margin: Int?                // quiet zone in modules; nil: the standard one
+    var correction: String?         // nil: the standard one
+    var foreground = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+    var background: CGColor? = CGColor(red: 1, green: 1, blue: 1, alpha: 1)   // nil: transparent
+    var shape = DataMatrixShape.square
+    var barHeight: Int?             // 1D codes, in modules; nil: the standard one
+    var label = true                // EAN/UPC: the digits under the bars
+}
+
+enum Symbol {
+    case matrix(ModuleMatrix)
+    case bars(LinearBarcode)
+}
+
+/// A CoreImage generator's output as modules, without the border it adds.
+func modules(_ image: CIImage, border: Int) -> ModuleMatrix {
+    let cg = CIContext().createCGImage(image, from: image.extent)!
+    let rep = NSBitmapImageRep(cgImage: cg)
+    let w = rep.pixelsWide - 2 * border, h = rep.pixelsHigh - 2 * border
+    var dark = [Bool](); dark.reserveCapacity(w * h)
+    for y in 0..<h { for x in 0..<w { dark.append((rep.colorAt(x: x + border, y: y + border)?.brightnessComponent ?? 1) < 0.5) } }
+    return ModuleMatrix(width: w, height: h, dark: dark)
+}
+
+func makeSymbol(_ o: MakeOptions) throws -> Symbol {
+    let correction = o.correction ?? o.kind.standardCorrection
+    let data = Data(o.text.utf8)
+    guard !o.text.isEmpty else { throw EncoderError.invalidCharacters("") }
+    switch o.kind {
+    case .qr:
+        let f = CIFilter.qrCodeGenerator(); f.message = data; f.correctionLevel = correction
+        guard let img = f.outputImage else { throw EncoderError.tooLong }
+        return .matrix(modules(img, border: 1))
+    case .aztec:
+        let f = CIFilter.aztecCodeGenerator(); f.message = data; f.correctionLevel = Float(correction) ?? 23
+        guard let img = f.outputImage else { throw EncoderError.tooLong }
+        return .matrix(modules(img, border: 2))
+    case .pdf417:
+        let f = CIFilter.pdf417BarcodeGenerator(); f.message = data
+        if let level = Float(correction) { f.correctionLevel = level }
+        guard let img = f.outputImage else { throw EncoderError.tooLong }
+        return .matrix(modules(img, border: 2))
+    case .datamatrix:
+        return .matrix(try encodeDataMatrix(o.text, shape: o.shape))
+    case .code128:
+        guard o.text.allSatisfy({ $0.isASCII }) else { throw EncoderError.invalidCharacters(o.text) }
+        let f = CIFilter.code128BarcodeGenerator(); f.message = data; f.quietSpace = 0; f.barcodeHeight = 1
+        guard let img = f.outputImage else { throw EncoderError.tooLong }
+        let row = modules(img, border: 0)
+        return .bars(LinearBarcode(text: o.text, modules: (0..<row.width).map { row[$0, 0] }, guardModules: []))
+    case .ean13: return .bars(try encodeEAN(o.text.filter { !$0.isWhitespace }, kind: .ean13))
+    case .upca: return .bars(try encodeEAN(o.text.filter { !$0.isWhitespace }, kind: .upcA))
+    case .ean8: return .bars(try encodeEAN(o.text.filter { !$0.isWhitespace }, kind: .ean8))
+    }
+}
+
+/// The code as a picture: whole pixels per module (crisp), at most `size` wide.
+func renderCode(_ o: MakeOptions) throws -> (image: CGImage, text: String) {
+    let symbol = try makeSymbol(o)
+    let m: (left: Int, right: Int) = o.margin.map { (left: $0, right: $0) } ?? o.kind.standardMargin
+    let space = CGColorSpace(name: CGColorSpace.sRGB)!
+    func context(_ w: Int, _ h: Int) -> CGContext {
+        let c = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        if let bg = o.background { c.setFillColor(bg); c.fill(CGRect(x: 0, y: 0, width: w, height: h)) }
+        c.setFillColor(o.foreground)
+        return c
+    }
+    switch symbol {
+    case .matrix(let mm):
+        let cols = mm.width + m.left + m.right, rows = mm.height + m.left + m.right
+        let px = max(1, o.size / cols)
+        let c = context(cols * px, rows * px)
+        for y in 0..<mm.height { for x in 0..<mm.width where mm[x, y] {
+            c.fill(CGRect(x: (x + m.left) * px, y: (rows - 1 - (y + m.left)) * px, width: px, height: px))
+        } }
+        return (c.makeImage()!, o.text)
+    case .bars(let b):
+        let n = b.modules.count, cols = n + m.left + m.right
+        let px = max(1, o.size / cols)
+        let standardHeight: Int = switch o.kind { case .ean13, .upca: 69; case .ean8: 55; default: max(30, n / 4) }
+        let barRows = max(1, o.barHeight ?? standardHeight)
+        let label = o.label && o.kind.retail
+        let vertical = 2, below = label ? 11 : 0, guardExtra = label ? 5 : 0
+        let rows = vertical + barRows + below + vertical
+        let c = context(cols * px, rows * px)
+        let top = (rows - vertical) * px                 // CoreGraphics counts from the bottom
+        for i in 0..<n where b.modules[i] {
+            let long = b.guardModules.contains(i) ? guardExtra : 0
+            let height = (barRows + long) * px
+            c.fill(CGRect(x: (m.left + i) * px, y: top - height, width: px, height: height))
+        }
+        if label { drawRetailDigits(b, kind: o.kind, into: c, px: px, left: m.left, baseline: (vertical + 1) * px, color: o.foreground) }   // digits fill the 11 modules under the bars
+        return (c.makeImage()!, b.text)
+    }
+}
+
+/// The digits under an EAN or UPC barcode, where they are printed by convention.
+func drawRetailDigits(_ b: LinearBarcode, kind: CodeKind, into c: CGContext, px: Int, left: Int, baseline: Int, color: CGColor) {
+    let digits = Array(b.text)
+    var places: [(Character, Double, Double)] = []   // digit, centre in modules from the code's left edge, size factor
+    switch kind {
+    case .ean13:
+        places.append((digits[0], -4.5, 1))
+        for i in 0..<6 { places.append((digits[1 + i], 3 + 7 * Double(i) + 3.5, 1)) }
+        for i in 0..<6 { places.append((digits[7 + i], 50 + 7 * Double(i) + 3.5, 1)) }
+    case .upca:
+        let t = digits.count == 13 ? Array(digits.dropFirst()) : digits
+        places.append((t[0], -4.5, 0.75))
+        for i in 1...5 { places.append((t[i], 3 + 7 * Double(i) + 3.5, 1)) }
+        for i in 0..<5 { places.append((t[6 + i], 50 + 7 * Double(i) + 3.5, 1)) }
+        places.append((t[11], 95 + 4.5, 0.75))
+    case .ean8:
+        for i in 0..<4 { places.append((digits[i], 3 + 7 * Double(i) + 3.5, 1)) }
+        for i in 0..<4 { places.append((digits[4 + i], 36 + 7 * Double(i) + 3.5, 1)) }
+    default: return
+    }
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(cgContext: c, flipped: false)
+    for (digit, centre, factor) in places {
+        // Digits as tall as the guard bars' extra length plus a little: their tops stay clear of the shorter bars.
+        let font = NSFont.monospacedDigitSystemFont(ofSize: CGFloat(10 * px) * factor, weight: .regular)
+        let s = NSAttributedString(string: String(digit), attributes: [.font: font, .foregroundColor: NSColor(cgColor: color) ?? .black])
+        let w = s.size().width
+        // draw(at:) places the line's bottom (descender included); put the digits' baseline on `baseline`.
+        s.draw(at: NSPoint(x: (Double(left) + centre) * Double(px) - w / 2, y: Double(baseline) + Double(font.descender)))
+    }
+    NSGraphicsContext.restoreGraphicsState()
+}
+
+/// What went wrong, for the person who typed the text.
+func makeProblem(_ error: Error, kind: CodeKind, shape: DataMatrixShape = .square) -> String {
+    switch error as? EncoderError {
+    case .tooLong where kind == .datamatrix && shape == .rectangle: "This is too much text for a rectangular Data Matrix: choose Square"
+    case .invalidCheckDigit(let expected): "The last digit should be \(expected): it’s the check digit of the others"
+    case .invalidCharacters(let t) where t.isEmpty: "Type the text to put in the code"
+    default: kind.hint
+    }
+}
+
+func pngData(_ image: CGImage) -> Data {
+    NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])!
+}
+
+/// A name that's free in `folder`: "QR code 2026-11-11 at 21.40.12.png", then " 2", " 3"…
+func freeFileName(_ base: String, in folder: URL) -> URL {
+    var url = folder.appendingPathComponent(base + ".png"), n = 2
+    while FileManager.default.fileExists(atPath: url.path) { url = folder.appendingPathComponent("\(base) \(n).png"); n += 1 }
+    return url
+}
+
+func defaultFileBase(_ kind: CodeKind) -> String {
+    let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
+    return "\(kind.title) \(f.string(from: Date()))"
+}
+
+var downloadsFolder: URL { FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0] }
+
+/// "#RRGGBB" or "#RRGGBBAA".
+func parseColor(_ text: String) -> CGColor? {
+    var t = text.trimmingCharacters(in: .whitespaces); if t.hasPrefix("#") { t.removeFirst() }
+    guard t.count == 6 || t.count == 8, let v = UInt64(t, radix: 16) else { return nil }
+    let a = t.count == 8 ? Double(v & 0xFF) / 255 : 1, rgb = t.count == 8 ? v >> 8 : v
+    return CGColor(red: Double(rgb >> 16 & 0xFF) / 255, green: Double(rgb >> 8 & 0xFF) / 255, blue: Double(rgb & 0xFF) / 255, alpha: a)
+}
+
+/// The Create tab: type, text, size and where to save, with the rest under Advanced.
+final class CreateView: NSView, NSTextViewDelegate {
+    let kindMenu = NSPopUpButton()
+    let textView = NSTextView()
+    let preview = NSImageView()
+    let sizeField = NSTextField(string: "1024")
+    let folderControl = NSPathControl()
+    let advancedButton = NSButton()
+    let correctionMenu = NSPopUpButton(), marginMenu = NSPopUpButton(), shapeMenu = NSPopUpButton()
+    let heightField = NSTextField(string: ""), labelBox = NSButton(checkboxWithTitle: "Digits under the barcode", target: nil, action: nil)
+    let foreground = NSColorWell(), background = NSColorWell()
+    let transparentBox = NSButton(checkboxWithTitle: "Transparent background", target: nil, action: nil)
+    let nameField = NSTextField(string: "")
+    let infoLabel = NSTextField(labelWithString: ""), statusLabel = NSTextField(labelWithString: "")
+    let saveButton = NSButton(title: "Save PNG", target: nil, action: nil)
+    let copyButton = NSButton(title: "Copy Image", target: nil, action: nil)
+    let revealButton = NSButton(title: "Show in Finder", target: nil, action: nil)
+    var rows: [String: NSGridRow] = [:]
+    var lastSaved: URL?
+    var current: CGImage?
+
+    init() {
+        super.init(frame: .zero)
+        kindMenu.addItems(withTitles: CodeKind.allCases.map(\.title))
+        kindMenu.target = self; kindMenu.action = #selector(kindChanged)
+        textView.isRichText = false; textView.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
+        textView.isAutomaticQuoteSubstitutionEnabled = false; textView.isAutomaticDashSubstitutionEnabled = false
+        textView.isAutomaticTextReplacementEnabled = false; textView.isAutomaticSpellingCorrectionEnabled = false
+        textView.delegate = self; textView.autoresizingMask = [.width]; textView.textContainerInset = NSSize(width: 4, height: 6)
+        textView.string = "https://github.com/casimir-engineering/shenzhen-qr"
+        let scroll = NSScrollView(); scroll.documentView = textView; scroll.hasVerticalScroller = true; scroll.borderType = .bezelBorder
+        scroll.heightAnchor.constraint(equalToConstant: 64).isActive = true
+        preview.imageScaling = .scaleProportionallyUpOrDown
+        preview.wantsLayer = true; preview.layer?.backgroundColor = NSColor.quaternaryLabelColor.cgColor; preview.layer?.cornerRadius = 6
+        sizeField.target = self; sizeField.action = #selector(changed)
+        sizeField.widthAnchor.constraint(equalToConstant: 70).isActive = true
+        folderControl.pathStyle = .popUp
+        folderControl.url = Settings.defaults.string(forKey: "makeFolder").map { URL(fileURLWithPath: $0) } ?? downloadsFolder
+        folderControl.target = self; folderControl.action = #selector(folderChosen)
+        folderControl.delegate = self
+
+        advancedButton.bezelStyle = .disclosure; advancedButton.setButtonType(.pushOnPushOff); advancedButton.title = ""
+        advancedButton.target = self; advancedButton.action = #selector(toggleAdvanced)
+        let advancedLabel = NSTextField(labelWithString: "Advanced")
+        marginMenu.addItem(withTitle: "Standard")
+        marginMenu.addItems(withTitles: (0...20).map { "\($0) modules" })
+        shapeMenu.addItems(withTitles: ["Square", "Rectangle"])
+        heightField.placeholderString = "Standard"
+        heightField.widthAnchor.constraint(equalToConstant: 70).isActive = true
+        foreground.color = .black; background.color = .white
+        nameField.placeholderString = "\(CodeKind.qr.title) <date and time>"
+        for c in [correctionMenu, marginMenu, shapeMenu] { c.target = self; c.action = #selector(changed) }
+        for c in [heightField, nameField] as [NSTextField] { c.target = self; c.action = #selector(changed) }
+        for c in [labelBox, transparentBox] { c.target = self; c.action = #selector(changed) }
+        labelBox.state = .on
+        for w in [foreground, background] { w.target = self; w.action = #selector(changed) }
+        let colors = NSStackView(views: [foreground, NSTextField(labelWithString: "on"), background, transparentBox])
+        let px = NSTextField(labelWithString: "modules")
+        nameField.widthAnchor.constraint(equalToConstant: 260).isActive = true
+        // One grid, so the labels line up: the basic rows, Advanced, then its rows (shown when open and when they
+        // apply to the type).
+        let basic = NSGridView(views: [
+            [NSTextField(labelWithString: "Type:"), kindMenu],
+            [NSTextField(labelWithString: "Content:"), scroll],
+            [NSTextField(labelWithString: "Width:"), NSStackView(views: [sizeField, NSTextField(labelWithString: "pixels"), infoLabel])],
+            [NSTextField(labelWithString: "Save in:"), folderControl],
+            [NSGridCell.emptyContentView, NSStackView(views: [advancedButton, advancedLabel])],
+        ])
+        let addRow = { (key: String, label: String, views: [NSView]) in
+            let content = views.count == 1 ? views[0] : NSStackView(views: views)
+            self.rows[key] = basic.addRow(with: [label.isEmpty ? NSGridCell.emptyContentView : NSTextField(labelWithString: label), content])
+        }
+        addRow("correction", "Error correction:", [correctionMenu])
+        addRow("margin", "Quiet zone:", [marginMenu])
+        addRow("shape", "Shape:", [shapeMenu])
+        addRow("height", "Bar height:", [heightField, px])
+        addRow("label", "", [labelBox])
+        addRow("colors", "Colors:", [colors])
+        addRow("name", "File name:", [nameField])
+        basic.column(at: 0).xPlacement = .trailing
+        basic.column(at: 0).width = 118
+        basic.rowSpacing = 8
+        basic.row(at: 1).yPlacement = .top
+        infoLabel.textColor = .secondaryLabelColor
+        scroll.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+
+        statusLabel.textColor = .secondaryLabelColor; statusLabel.lineBreakMode = .byTruncatingMiddle
+        saveButton.target = self; saveButton.action = #selector(save); saveButton.keyEquivalent = "s"; saveButton.keyEquivalentModifierMask = .command
+        copyButton.target = self; copyButton.action = #selector(copyImage)
+        revealButton.target = self; revealButton.action = #selector(reveal); revealButton.isHidden = true
+        let bottom = NSStackView(views: [statusLabel, revealButton, NSView(), copyButton, saveButton])
+
+        let stack = NSStackView(views: [preview, basic, bottom])
+        stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 10
+        stack.edgeInsets = NSEdgeInsets(top: 12, left: 12, bottom: 12, right: 12)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: topAnchor), stack.bottomAnchor.constraint(equalTo: bottomAnchor),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor), stack.trailingAnchor.constraint(equalTo: trailingAnchor),
+            preview.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -24),
+            bottom.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -24),
+            basic.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -24),
+            preview.heightAnchor.constraint(greaterThanOrEqualToConstant: 160),
+        ])
+        preview.setContentHuggingPriority(.defaultLow, for: .vertical)
+        preview.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        kindChanged()
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    var kind: CodeKind { CodeKind.allCases[max(0, kindMenu.indexOfSelectedItem)] }
+
+    /// Advanced shows only what applies to this type, with its standard values.
+    @objc func kindChanged() {
+        let k = kind
+        correctionMenu.removeAllItems()
+        correctionMenu.addItems(withTitles: k.corrections.map(\.title))
+        correctionMenu.selectItem(at: k.corrections.firstIndex { $0.key == k.standardCorrection } ?? 0)
+        marginMenu.item(at: 0)?.title = "Standard (\(k.standardMargin.left == k.standardMargin.right ? "\(k.standardMargin.left)" : "\(k.standardMargin.left) and \(k.standardMargin.right)") modules)"
+        marginMenu.selectItem(at: 0)
+        showRows()
+        nameField.placeholderString = "\(k.title) <date and time>"
+        if k.retail, textView.string.contains(where: { !$0.isNumber && !$0.isWhitespace }) { textView.string = "" }
+        changed()
+    }
+
+    @objc func toggleAdvanced() { showRows() }
+
+    /// Advanced rows: shown when Advanced is open, each only for the types it applies to.
+    func showRows() {
+        let open = advancedButton.state == .on, k = kind
+        let applies: [String: Bool] = ["correction": !k.corrections.isEmpty, "shape": k == .datamatrix, "height": k.linear, "label": k.retail]
+        for (key, row) in rows { row.isHidden = !open || applies[key] == false }
+    }
+
+    func textDidChange(_ notification: Notification) { changed() }
+
+    var options: MakeOptions {
+        var o = MakeOptions()
+        o.kind = kind
+        o.text = textView.string
+        o.size = max(16, min(20000, sizeField.integerValue > 0 ? sizeField.integerValue : 1024))
+        o.margin = marginMenu.indexOfSelectedItem > 0 ? marginMenu.indexOfSelectedItem - 1 : nil
+        if !kind.corrections.isEmpty { o.correction = kind.corrections[max(0, correctionMenu.indexOfSelectedItem)].key }
+        o.shape = shapeMenu.indexOfSelectedItem == 1 ? .rectangle : .square
+        o.barHeight = heightField.integerValue > 0 ? heightField.integerValue : nil
+        o.label = labelBox.state == .on
+        o.foreground = foreground.color.usingColorSpace(.sRGB)?.cgColor ?? o.foreground
+        o.background = transparentBox.state == .on ? nil : background.color.usingColorSpace(.sRGB)?.cgColor
+        return o
+    }
+
+    @objc func changed() {
+        do {
+            let (image, _) = try renderCode(options)
+            current = image
+            preview.image = NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
+            infoLabel.stringValue = "\(image.width) × \(image.height)"
+            statusLabel.stringValue = ""; statusLabel.textColor = .secondaryLabelColor
+            saveButton.isEnabled = true; copyButton.isEnabled = true
+        } catch {
+            current = nil; preview.image = nil; infoLabel.stringValue = ""
+            statusLabel.stringValue = makeProblem(error, kind: kind, shape: options.shape); statusLabel.textColor = .systemRed
+            saveButton.isEnabled = false; copyButton.isEnabled = false
+        }
+        revealButton.isHidden = true
+    }
+
+    @objc func folderChosen() {
+        if let url = folderControl.url { Settings.defaults.set(url.path, forKey: "makeFolder") }
+    }
+
+    @objc func save() {
+        guard let image = current else { return }
+        let folder = folderControl.url ?? downloadsFolder
+        let name = nameField.stringValue.trimmingCharacters(in: .whitespaces)
+        let url = freeFileName(name.isEmpty ? defaultFileBase(kind) : (name.hasSuffix(".png") ? String(name.dropLast(4)) : name), in: folder)
+        do {
+            try pngData(image).write(to: url)
+            lastSaved = url
+            statusLabel.textColor = .secondaryLabelColor
+            statusLabel.stringValue = "Saved “\(url.lastPathComponent)” in \(folder.lastPathComponent)"
+            revealButton.isHidden = false
+        } catch {
+            statusLabel.textColor = .systemRed
+            statusLabel.stringValue = "Couldn’t save in \(folder.lastPathComponent): \(error.localizedDescription)"
+        }
+    }
+
+    @objc func copyImage() {
+        guard let image = current else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setData(pngData(image), forType: .png)
+        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.stringValue = "Image copied"
+        revealButton.isHidden = true
+    }
+
+    @objc func reveal() { if let lastSaved { NSWorkspace.shared.activateFileViewerSelecting([lastSaved]) } }
+}
+
+extension CreateView: NSPathControlDelegate {
+    /// The folder menu offers Choose… for any folder.
+    func pathControl(_ pathControl: NSPathControl, willDisplay openPanel: NSOpenPanel) {
+        openPanel.canChooseDirectories = true; openPanel.canChooseFiles = false; openPanel.canCreateDirectories = true
+        openPanel.prompt = "Choose"
+    }
+}
+
+// MARK: - Updates (ShenzhenPDF's updater, in Swift)
+
+/// Checks GitHub once a day (and on Check for Updates…), downloads ShenzhenQR.dmg, checks it is ours (Developer ID
+/// team, notarized, hardened runtime, bundle ID, published version), then swaps the app in place and reopens it.
+enum Update {
+    static let repo = "casimir-engineering/shenzhen-qr"
+    static let asset = "ShenzhenQR.dmg"
+    static let team = "66LJ4BV7Q3"
+    static let bundleID = "com.intuition.shenzhenqr"
+    static let releasesPage = URL(string: "https://github.com/\(repo)/releases/latest")!
+    static let maxDownload = 64 * 1024 * 1024
+    static let requirement = "anchor apple generic and certificate leaf[subject.OU] = \"\(team)\" and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"
+    static var d: UserDefaults { Settings.defaults }
+
+    struct Release { let tag: String; let version: String; let url: URL; let size: Int; let digest: String?; let notes: String }
+
+    enum Failure: Error, CustomStringConvertible {
+        case message(String)
+        var description: String { if case .message(let m) = self { return m }; return "" }
+    }
+
+    static var currentVersion: String { appBundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "" }
+
+    /// "v1.2.3" or "1.2.3" as numbers; nil when not all numbers.
+    static func numbers(_ v: String) -> [Int]? {
+        let t = v.hasPrefix("v") ? String(v.dropFirst()) : v
+        let parts = t.split(separator: ".").map { Int($0) }
+        return parts.isEmpty || parts.contains(nil) ? nil : parts.map { $0! }
+    }
+    static func compare(_ a: String, _ b: String) -> Int {
+        guard let x = numbers(a), let y = numbers(b) else { return 0 }
+        for i in 0..<max(x.count, y.count) {
+            let p = i < x.count ? x[i] : 0, q = i < y.count ? y[i] : 0
+            if p != q { return p < q ? -1 : 1 }
+        }
+        return 0
+    }
+
+    static var autoUpdate: Bool {
+        get { d.object(forKey: "autoUpdate") as? Bool ?? true }
+        set { d.set(newValue, forKey: "autoUpdate") }
+    }
+
+    /// Where the app runs from can't be replaced: a disk image or a translocated copy.
+    static var cantUpdateHere: Bool {
+        let path = appBundle.bundlePath
+        return path.hasPrefix("/Volumes/") || path.contains("/AppTranslocation/") || path.hasPrefix("/private/var/folders")
+    }
+
+    static func latestRelease(conditional: Bool) throws -> Release? {
+        var request = URLRequest(url: URL(string: "https://api.github.com/repos/\(repo)/releases/latest")!, timeoutInterval: 15)
+        request.setValue("ShenzhenQR/\(currentVersion) (macOS; +https://github.com/\(repo))", forHTTPHeaderField: "User-Agent")
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
+        if conditional, let etag = d.string(forKey: "updateETag") { request.setValue(etag, forHTTPHeaderField: "If-None-Match") }
+        let config = URLSessionConfiguration.ephemeral
+        config.waitsForConnectivity = false
+        let (data, response, error) = URLSession(configuration: config).syncData(request)
+        guard error == nil, let http = response as? HTTPURLResponse else { throw Failure.message("Could not reach the update server.") }
+        if http.statusCode == 304 { return nil }
+        guard http.statusCode == 200, let data else { throw Failure.message("The update server returned an unexpected response.") }
+        if let etag = http.value(forHTTPHeaderField: "ETag") { d.set(etag, forKey: "updateETag") }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any], let tag = json["tag_name"] as? String,
+              numbers(tag) != nil else { throw Failure.message("The update server response was malformed.") }
+        if json["draft"] as? Bool == true || json["prerelease"] as? Bool == true { return nil }
+        guard let a = (json["assets"] as? [[String: Any]])?.first(where: { $0["name"] as? String == asset }),
+              let link = (a["browser_download_url"] as? String).flatMap(URL.init(string:)) else { return nil }
+        let version = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+        return Release(tag: tag, version: version, url: link, size: a["size"] as? Int ?? 0,
+                       digest: (a["digest"] as? String)?.replacingOccurrences(of: "sha256:", with: ""),
+                       notes: json["body"] as? String ?? "")
+    }
+
+    /// A release worth offering: newer than this one and never older than the newest seen (no downgrades).
+    static func offerable(_ r: Release) -> Bool {
+        let highest = d.string(forKey: "highestVersionSeen") ?? currentVersion
+        if compare(r.version, highest) > 0 { d.set(r.version, forKey: "highestVersionSeen") }
+        return compare(r.version, currentVersion) > 0 && compare(r.version, highest) >= 0
+    }
+
+    /// The release notes for the prompt: up to the first ---, list items as •, plain text, at most 500 characters.
+    static func shortNotes(_ body: String) -> String {
+        var text = body.components(separatedBy: "\n---").first ?? body
+        text = text.split(separator: "\n", omittingEmptySubsequences: false).map { line -> String in
+            var l = line.trimmingCharacters(in: .whitespaces)
+            if l.hasPrefix("- ") || l.hasPrefix("* ") { l = "• " + l.dropFirst(2) }
+            while l.hasPrefix("#") { l = String(l.dropFirst()) }
+            return l.replacingOccurrences(of: "`", with: "").trimmingCharacters(in: .whitespaces)
+        }.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        text = String(text.unicodeScalars.filter { !(0x202A...0x202E).contains($0.value) && !(0x2066...0x2069).contains($0.value)
+                                                     && ($0.value >= 32 || $0 == "\n") })
+        return text.count > 500 ? String(text.prefix(500)) + "\n…" : text
+    }
+
+    // MARK: Checking the download
+
+    /// nil when the code at `url` is ours; otherwise why not (not shown, the user sees a general message).
+    static func verify(_ url: URL, notarized: Bool, app: Bool) -> String? {
+        var code: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(url as CFURL, [], &code) == errSecSuccess, let code else { return "unreadable" }
+        var req: SecRequirement?
+        guard SecRequirementCreateWithString((requirement + (notarized ? " and notarized" : "")) as CFString, [], &req) == errSecSuccess
+        else { return "requirement" }
+        let flags = app ? SecCSFlags(rawValue: kSecCSCheckAllArchitectures | kSecCSCheckNestedCode | kSecCSStrictValidate) : []
+        guard SecStaticCodeCheckValidityWithErrors(code, flags, req, nil) == errSecSuccess else { return "signature or notarization" }
+        var info: CFDictionary?
+        guard SecCodeCopySigningInformation(code, SecCSFlags(rawValue: kSecCSSigningInformation), &info) == errSecSuccess,
+              let dict = info as? [String: Any] else { return "signing information" }
+        guard dict[kSecCodeInfoTeamIdentifier as String] as? String == team else { return "team" }
+        if app {
+            let codeFlags = (dict[kSecCodeInfoFlags as String] as? NSNumber)?.uint32Value ?? 0
+            guard codeFlags & 0x10000 != 0 else { return "hardened runtime" }
+            guard (dict[kSecCodeInfoPList as String] as? [String: Any])?["CFBundleIdentifier"] as? String == bundleID else { return "bundle" }
+        }
+        return nil
+    }
+
+    static func run(_ tool: String, _ args: [String]) -> (status: Int32, output: Data) {
+        let p = Process(), pipe = Pipe()
+        p.executableURL = URL(fileURLWithPath: tool); p.arguments = args
+        p.standardOutput = pipe; p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return (-1, Data()) }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return (p.terminationStatus, data)
+    }
+
+    /// Checks the downloaded disk image and takes the app out of it, checked too, into `staging`. Returns the app.
+    static func prepare(dmg: URL, release: Release, staging: URL) throws -> URL {
+        let size = (try? FileManager.default.attributesOfItem(atPath: dmg.path)[.size] as? Int) ?? -1
+        if release.size > 0, size != release.size { throw Failure.message("The downloaded update was incomplete.") }
+        if let digest = release.digest, let data = try? Data(contentsOf: dmg) {
+            let hex = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+            if hex != digest.lowercased() { throw Failure.message("The downloaded update appears to be corrupted.") }
+        }
+        guard verify(dmg, notarized: true, app: false) == nil else { throw Failure.message("The update could not be verified and was not installed.") }
+        let attach = run("/usr/bin/hdiutil", ["attach", "-nobrowse", "-readonly", "-noautoopen", "-plist", dmg.path])
+        guard attach.status == 0, let plist = try? PropertyListSerialization.propertyList(from: attach.output, format: nil) as? [String: Any]
+        else { throw Failure.message("The update disk image could not be opened.") }
+        guard let mount = (plist["system-entities"] as? [[String: Any]])?.compactMap({ $0["mount-point"] as? String }).first
+        else { throw Failure.message("The update disk image had no mount point.") }
+        defer { if run("/usr/bin/hdiutil", ["detach", mount]).status != 0 { _ = run("/usr/bin/hdiutil", ["detach", "-force", mount]) } }
+        let fm = FileManager.default
+        let apps = ((try? fm.contentsOfDirectory(atPath: mount)) ?? []).filter { name in
+            let path = (mount as NSString).appendingPathComponent(name)
+            return name.hasSuffix(".app") && (try? fm.destinationOfSymbolicLink(atPath: path)) == nil
+                && Bundle(path: path)?.bundleIdentifier == bundleID
+        }
+        guard apps.count == 1 else { throw Failure.message("The update disk image did not contain ShenzhenQR.") }
+        let staged = staging.appendingPathComponent("ShenzhenQR.app")
+        guard run("/usr/bin/ditto", [(mount as NSString).appendingPathComponent(apps[0]), staged.path]).status == 0
+        else { throw Failure.message("The update could not be extracted.") }
+        guard verify(staged, notarized: false, app: true) == nil else { throw Failure.message("The update could not be verified and was not installed.") }
+        guard Bundle(url: staged)?.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String == release.version
+        else { throw Failure.message("The update did not match the published version.") }
+        _ = run("/usr/bin/xattr", ["-dr", "com.apple.quarantine", staged.path])
+        return staged
+    }
+
+    /// A folder for the update beside the app, on its volume, so the swap is a rename.
+    static func stagingFolder() throws -> URL {
+        let parent = appBundle.bundleURL.deletingLastPathComponent()
+        guard FileManager.default.isWritableFile(atPath: parent.path) else {
+            throw Failure.message("ShenzhenQR can’t replace itself in “\(parent.lastPathComponent)”. Download the new version and drag it there instead.")
+        }
+        do { return try FileManager.default.url(for: .itemReplacementDirectory, in: .userDomainMask, appropriateFor: parent, create: true) }
+        catch { throw Failure.message("Could not create a staging directory for the update.") }
+    }
+
+    /// Run as `ShenzhenQR --post-update <staged.app> <target.app> <pid>`, after the app quits: swaps the app (keeping
+    /// the old one beside it until the next launch), checks it again, reopens it. Puts the old one back on failure.
+    static func postUpdate(staged: URL, target: URL, pid: pid_t) -> Never {
+        setsid()
+        let fm = FileManager.default, old = URL(fileURLWithPath: target.path + ".old")
+        func reopen(_ url: URL) {
+            let config = NSWorkspace.OpenConfiguration(); config.createsNewApplicationInstance = true
+            let done = DispatchSemaphore(value: 0)
+            NSWorkspace.shared.openApplication(at: url, configuration: config) { _, _ in done.signal() }
+            _ = done.wait(timeout: .now() + 20)
+        }
+        func giveUp() -> Never {
+            try? fm.removeItem(at: staged)
+            d.removeObject(forKey: "updatePendingVersion")
+            reopen(target)
+            exit(1)
+        }
+        for _ in 0..<40 where kill(pid, 0) == 0 { usleep(500_000) }       // wait up to 20 s for the app to quit
+        guard kill(pid, 0) != 0, verify(staged, notarized: false, app: true) == nil else { giveUp() }
+        usleep(500_000)
+        try? fm.removeItem(at: old)
+        guard rename(target.path, old.path) == 0 else { giveUp() }
+        guard rename(staged.path, target.path) == 0 else { _ = rename(old.path, target.path); giveUp() }
+        guard verify(target, notarized: false, app: true) == nil else {
+            try? fm.removeItem(at: target); _ = rename(old.path, target.path); giveUp()
+        }
+        _ = run("/usr/bin/xattr", ["-dr", "com.apple.quarantine", target.path])
+        LSRegisterURL(target as CFURL, true)
+        reopen(target)
+        exit(0)
+    }
+
+    /// At launch: says when an update just finished; removes the previous app kept from an update.
+    static func afterLaunch() -> String? {
+        let old = appBundle.bundlePath + ".old"
+        var finished: String?
+        if let pending = d.string(forKey: "updatePendingVersion") {
+            d.removeObject(forKey: "updatePendingVersion")
+            if compare(pending, currentVersion) == 0 { finished = pending; try? FileManager.default.removeItem(atPath: old) }
+        } else if let made = (try? FileManager.default.attributesOfItem(atPath: old))?[.modificationDate] as? Date,
+                  Date().timeIntervalSince(made) > 3600 {
+            try? FileManager.default.removeItem(atPath: old)
+        }
+        return finished
+    }
+}
+
+extension URLSession {
+    /// A request run to its end, for code already off the main thread.
+    func syncData(_ request: URLRequest) -> (Data?, URLResponse?, Error?) {
+        var result: (Data?, URLResponse?, Error?) = (nil, nil, nil)
+        let done = DispatchSemaphore(value: 0)
+        dataTask(with: request) { result = ($0, $1, $2); done.signal() }.resume()
+        done.wait()
+        return result
+    }
+}
+
+/// The window side: daily checks, the prompt, the download with its progress panel, and the swap.
+final class Updater: NSObject, URLSessionDownloadDelegate {
+    static let shared = Updater()
+    private let queue = DispatchQueue(label: "update", qos: .utility)
+    private var busy = false, timer: Timer?
+    private var panel: NSPanel?, heading = NSTextField(labelWithString: ""), detail = NSTextField(labelWithString: "")
+    private var bar = NSProgressIndicator()
+    private var task: URLSessionDownloadTask?, release: Update.Release?, staging: URL?, cancelled = false
+    private var pendingPrompt: Update.Release?
+
+    func start() {
+        if let done = Update.afterLaunch() {
+            let a = NSAlert(); a.messageText = "You’re now on ShenzhenQR \(done)."; a.runModal()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { self.dailyCheck() }
+        timer = Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { _ in self.dailyCheck() }
+        timer?.tolerance = 600
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { _ in self.dailyCheck() }
+        NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
+            if let r = self.pendingPrompt { self.pendingPrompt = nil; self.prompt(r, manual: false) }
+        }
+    }
+
+    /// Once a day at most: the time is noted before asking, so a crash still counts as the day's check.
+    func dailyCheck() {
+        guard Update.autoUpdate, !busy, !Update.cantUpdateHere else { return }
+        let last = Update.d.double(forKey: "lastUpdateCheck"), now = Date().timeIntervalSince1970
+        guard last == 0 || now - last >= 86400 || now < last - 60 else { return }
+        Update.d.set(now, forKey: "lastUpdateCheck")
+        check(manual: false)
+    }
+
+    @objc func checkNow() { check(manual: true) }
+
+    func check(manual: Bool) {
+        if busy { if manual { say("An update is already in progress.") }; return }
+        if Update.cantUpdateHere {
+            if manual { say("To enable automatic updates, move ShenzhenQR to your Applications folder.") }
+            return
+        }
+        busy = true
+        queue.async {
+            let result = Result { try Update.latestRelease(conditional: !manual) }
+            DispatchQueue.main.async {
+                self.busy = false
+                switch result {
+                case .failure(let e): if manual { self.say(String(describing: e)) }
+                case .success(let r):
+                    guard let r, Update.offerable(r) else {
+                        if manual { self.say("You’re up to date.", "ShenzhenQR \(Update.currentVersion) is the latest version.") }
+                        return
+                    }
+                    if !manual {
+                        if Update.d.string(forKey: "skippedUpdateVersion") == r.version { return }
+                        if Update.d.string(forKey: "deferredUpdateVersion") == r.version,
+                           Date().timeIntervalSince1970 < Update.d.double(forKey: "remindUpdateAfter") { return }
+                        if !NSApp.isActive { self.pendingPrompt = r; return }
+                    }
+                    self.prompt(r, manual: manual)
+                }
+            }
+        }
+    }
+
+    func prompt(_ r: Update.Release, manual: Bool) {
+        let a = NSAlert()
+        a.messageText = "A new version of ShenzhenQR is available"
+        let notes = Update.shortNotes(r.notes)
+        a.informativeText = "ShenzhenQR \(r.version) is available — you have \(Update.currentVersion). Would you like to install it now?"
+            + (notes.isEmpty ? "" : "\n\n" + notes)
+        a.addButton(withTitle: "Install and Relaunch")
+        a.addButton(withTitle: "Skip This Version")
+        a.addButton(withTitle: "Later")
+        switch a.runModal() {
+        case .alertFirstButtonReturn: download(r)
+        case .alertSecondButtonReturn: Update.d.set(r.version, forKey: "skippedUpdateVersion")
+        default:
+            Update.d.set(r.version, forKey: "deferredUpdateVersion")
+            Update.d.set(Date().timeIntervalSince1970 + 7 * 86400, forKey: "remindUpdateAfter")
+        }
+    }
+
+    func download(_ r: Update.Release) {
+        guard r.url.scheme == "https" else { say("The update download URL was not secure."); return }
+        let folder: URL
+        do { folder = try Update.stagingFolder() } catch {
+            let a = NSAlert(); a.alertStyle = .warning; a.messageText = "Software Update"; a.informativeText = String(describing: error)
+            a.addButton(withTitle: "Open Download Page"); a.addButton(withTitle: "Cancel")
+            if a.runModal() == .alertFirstButtonReturn { NSWorkspace.shared.open(Update.releasesPage) }
+            return
+        }
+        if let free = (try? folder.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?.volumeAvailableCapacityForImportantUsage,
+           r.size > 0, free < Int64(r.size * 3) {
+            say("There is not enough disk space to install the update."); return
+        }
+        busy = true; release = r; staging = folder; cancelled = false
+        showPanel(r)
+        var request = URLRequest(url: r.url, timeoutInterval: 60)
+        request.setValue("ShenzhenQR/\(Update.currentVersion) (macOS; +https://github.com/\(Update.repo))", forHTTPHeaderField: "User-Agent")
+        let session = URLSession(configuration: .ephemeral, delegate: self, delegateQueue: .main)
+        task = session.downloadTask(with: request)
+        task?.resume()
+    }
+
+    private var redirects = 0
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        redirects += 1
+        completionHandler(request.url?.scheme == "https" && redirects <= 5 ? request : nil)
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64,
+                    totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
+        let ceiling = Int64(min(Update.maxDownload, (release?.size ?? 0) > 0 ? release!.size + 1 : Update.maxDownload))
+        if totalBytesWritten > ceiling || totalBytesExpectedToWrite > Int64(Update.maxDownload) { downloadTask.cancel(); return }
+        let total = totalBytesExpectedToWrite > 0 ? totalBytesExpectedToWrite : Int64(release?.size ?? 0)
+        if total > 0 { bar.isIndeterminate = false; bar.doubleValue = Double(totalBytesWritten) / Double(total) }
+        detail.stringValue = String(format: "%.1f MB of %.1f MB", Double(totalBytesWritten) / 1e6, Double(total) / 1e6)
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+        guard let staging, let release else { return }
+        let dmg = staging.appendingPathComponent(Update.asset)
+        do { try FileManager.default.moveItem(at: location, to: dmg) } catch { finish(error: "The downloaded update could not be saved."); return }
+        detail.stringValue = "Verifying signature…"
+        bar.isIndeterminate = true; bar.startAnimation(nil)
+        queue.async {
+            let result = Result { try Update.prepare(dmg: dmg, release: release, staging: staging) }
+            DispatchQueue.main.async {
+                switch result {
+                case .failure(let e): self.finish(error: String(describing: e))
+                case .success(let app): self.detail.stringValue = "Preparing update…"; self.install(app, release)
+                }
+            }
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        guard let error else { return }
+        if cancelled { finish(error: nil) } else { finish(error: (error as NSError).code == NSURLErrorCancelled
+            ? "The downloaded update was incomplete." : "The update could not be downloaded.") }
+    }
+
+    func install(_ app: URL, _ r: Update.Release) {
+        panel?.orderOut(nil)
+        let a = NSAlert()
+        a.messageText = "ShenzhenQR will close and reopen to finish updating."
+        a.addButton(withTitle: "Install Now"); a.addButton(withTitle: "Cancel")
+        guard a.runModal() == .alertFirstButtonReturn else { finish(error: nil); return }
+        Update.d.set(r.version, forKey: "updatePendingVersion")
+        Update.d.synchronize()
+        let helper = Process()
+        helper.executableURL = URL(fileURLWithPath: appBundle.executablePath!)
+        helper.arguments = ["--post-update", app.path, appBundle.bundlePath, String(getpid())]
+        do { try helper.run() } catch { Update.d.removeObject(forKey: "updatePendingVersion"); finish(error: "The update could not be extracted."); return }
+        NSApp.terminate(nil)
+    }
+
+    @objc func cancelDownload() { cancelled = true; task?.cancel() }
+
+    func finish(error: String?) {
+        busy = false; panel?.orderOut(nil); panel = nil; task = nil
+        if let staging { try? FileManager.default.removeItem(at: staging) }
+        staging = nil
+        if let error { say(error) }
+    }
+
+    func showPanel(_ r: Update.Release) {
+        let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 380, height: 120), styleMask: [.titled], backing: .buffered, defer: false)
+        p.title = "Software Update"
+        heading.stringValue = "Downloading ShenzhenQR \(r.version)"
+        heading.font = .boldSystemFont(ofSize: 13)
+        detail.stringValue = "Starting…"; detail.textColor = .secondaryLabelColor
+        bar = NSProgressIndicator(); bar.isIndeterminate = false; bar.minValue = 0; bar.maxValue = 1; bar.doubleValue = 0
+        let cancel = NSButton(title: "Cancel", target: self, action: #selector(cancelDownload))
+        let stack = NSStackView(views: [heading, bar, detail, cancel])
+        stack.orientation = .vertical; stack.alignment = .leading
+        stack.edgeInsets = NSEdgeInsets(top: 16, left: 20, bottom: 16, right: 20)
+        bar.widthAnchor.constraint(equalToConstant: 340).isActive = true
+        cancel.setContentHuggingPriority(.required, for: .horizontal)
+        p.contentView = stack
+        p.center(); p.makeKeyAndOrderFront(nil)
+        panel = p
+    }
+
+    func say(_ title: String, _ text: String = "") {
+        let a = NSAlert()
+        if text.isEmpty && !title.hasPrefix("You’re") { a.alertStyle = .warning; a.messageText = "Software Update"; a.informativeText = title }
+        else { a.messageText = title; a.informativeText = text }
+        a.runModal()
+    }
+
+    @objc func toggleAutomatic(_ item: NSMenuItem) {
+        Update.autoUpdate.toggle()
+        item.state = Update.autoUpdate ? .on : .off
+    }
+}
+
 // MARK: - Entry
 
 let args = CommandLine.arguments
+if args.count == 5, args[1] == "--post-update", let pid = pid_t(args[4]) {
+    Update.postUpdate(staged: URL(fileURLWithPath: args[2]), target: URL(fileURLWithPath: args[3]), pid: pid)
+}
 if args.count > 1, CLI.commands.contains(args[1]) { CLI.main(args) }
 
 let app = NSApplication.shared
@@ -1680,6 +2997,11 @@ app.setActivationPolicy(.regular)
 let menu = NSMenu(), appItem = NSMenuItem(), editItem = NSMenuItem()
 menu.addItem(appItem); menu.addItem(editItem)
 let appMenu = NSMenu()
+appMenu.addItem(withTitle: "Check for Updates…", action: #selector(Updater.checkNow), keyEquivalent: "").target = Updater.shared
+let autoItem = appMenu.addItem(withTitle: "Automatically Check for Updates", action: #selector(Updater.toggleAutomatic(_:)), keyEquivalent: "")
+autoItem.target = Updater.shared
+autoItem.state = Update.autoUpdate ? .on : .off
+appMenu.addItem(.separator())
 appMenu.addItem(withTitle: "Settings…", action: #selector(AppDelegate.openSettings), keyEquivalent: ",")
 appMenu.addItem(.separator())
 appMenu.addItem(withTitle: "Quit ShenzhenQR", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
