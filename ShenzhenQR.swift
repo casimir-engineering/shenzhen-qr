@@ -276,6 +276,73 @@ final class PreviewView: NSView {
     override func layout() { super.layout(); layerPreview.frame = bounds }
 }
 
+// MARK: - Installing from the disk image
+
+enum Installer {
+    static let appName = "ShenzhenQR.app"
+
+    /// Mounted ShenzhenQR disk images: the app and an Applications link at the root.
+    static func installerVolumes() -> [URL] {
+        let fm = FileManager.default
+        return (fm.mountedVolumeURLs(includingResourceValuesForKeys: nil, options: []) ?? []).filter {
+            $0.path.hasPrefix("/Volumes/")
+                && fm.fileExists(atPath: $0.appendingPathComponent(appName).path)
+                && (try? fm.destinationOfSymbolicLink(atPath: $0.appendingPathComponent("Applications").path)) == "/Applications"
+        }
+    }
+
+    static func runningVolume() -> URL? {
+        let bundle = Bundle.main.bundleURL.standardizedFileURL.path
+        return installerVolumes().first { bundle.hasPrefix($0.standardizedFileURL.path + "/") }
+    }
+
+    /// Opened straight from the disk image: offer to copy it to Applications, open that copy and quit.
+    /// Returns true when this instance is quitting.
+    static func offerMove() -> Bool {
+        guard runningVolume() != nil else { return false }
+        let alert = NSAlert()
+        alert.messageText = "Move ShenzhenQR to Applications?"
+        alert.informativeText = "ShenzhenQR is running from its disk image. Once it’s in Applications, the disk image is ejected."
+        alert.addButton(withTitle: "Move to Applications")
+        alert.addButton(withTitle: "Not Now")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return false }
+        let fm = FileManager.default, target = URL(fileURLWithPath: "/Applications").appendingPathComponent(appName)
+        do {
+            if fm.fileExists(atPath: target.path) { try fm.trashItem(at: target, resultingItemURL: nil) }
+            try fm.copyItem(at: Bundle.main.bundleURL, to: target)
+        } catch {
+            let failed = NSAlert()
+            failed.messageText = "ShenzhenQR couldn’t be moved to Applications"
+            failed.informativeText = "Drag it onto the Applications folder instead. (\(error.localizedDescription))"
+            failed.runModal()
+            return false
+        }
+        let config = NSWorkspace.OpenConfiguration()
+        config.createsNewApplicationInstance = true
+        NSWorkspace.shared.openApplication(at: target, configuration: config) { _, _ in
+            DispatchQueue.main.async { NSApp.terminate(nil) }
+        }
+        return true
+    }
+
+    /// Running from Applications: eject any ShenzhenQR disk image still mounted, which also closes its Finder window.
+    /// Retries for a few seconds, while a copy that was running from it quits.
+    static func ejectInstallerDisk() {
+        guard runningVolume() == nil else { return }
+        let volumes = installerVolumes()
+        guard !volumes.isEmpty else { return }
+        DispatchQueue.global().async {
+            for volume in volumes {
+                for _ in 0..<10 {
+                    if (try? NSWorkspace.shared.unmountAndEjectDevice(at: volume)) != nil { break }
+                    Thread.sleep(forTimeInterval: 1)
+                }
+            }
+        }
+    }
+}
+
 // MARK: - Window
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
@@ -293,6 +360,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
 
     func applicationDidFinishLaunching(_ n: Notification) {
         AppDelegate.shared = self
+        if Installer.offerMove() { return }
+        Installer.ejectInstallerDisk()
         buildWindow()
         scanner.onCode = { [weak self] text, symbology in self?.found(text, symbology) }
         NSApp.activate(ignoringOtherApps: true)
@@ -357,8 +426,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
         scroll.heightAnchor.constraint(equalToConstant: 110).isActive = true
         preview.setContentHuggingPriority(.defaultLow, for: .vertical)
         window.contentView = stack
+        if offscreen { return }
         if !window.setFrameUsingName("main") { window.center() }
         window.makeKeyAndOrderFront(nil)
+    }
+
+    var offscreen = false
+
+    /// The README's screenshot: the window as it looks after reading `scene`, a picture standing in for the camera.
+    /// Drawn off screen; no camera, no clipboard.
+    func renderScreenshot(scene: String, out: String) {
+        offscreen = true
+        NSApp.appearance = NSAppearance(named: .aqua)
+        buildWindow()
+        window.setContentSize(NSSize(width: 560, height: 640))
+        let image = NSImage(contentsOfFile: scene)!
+        let imageView = NSImageView(image: image)
+        imageView.imageScaling = .scaleProportionallyUpOrDown
+        imageView.frame = preview.bounds
+        imageView.autoresizingMask = [.width, .height]
+        preview.addSubview(imageView)
+        cameraMenu.addItem(withTitle: "FaceTime HD Camera")
+        if let code = decode(VNImageRequestHandler(url: URL(fileURLWithPath: scene), options: [:])),
+           let text = code.payloadStringValue {
+            textView.string = text
+            kindLabel.stringValue = "\(symbologyName(code.symbology)) · \(Payload.kind(text))"
+            refreshActions()
+            setStatus("")
+        }
+        let content = window.contentView!
+        content.layoutSubtreeIfNeeded()
+        imageView.frame = preview.bounds
+        content.displayIfNeeded()
+        let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds)!
+        content.cacheDisplay(in: content.bounds, to: rep)
+        try! rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: out))
     }
 
     func reloadCameras() {
@@ -395,8 +497,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
         if repeated && textView.string != text { return }
         textView.string = text
         kindLabel.stringValue = "\(symbologyName(symbology)) · \(Payload.kind(text))"
-        Payload.copy(text)
-        setStatus("Copied to the clipboard")
+        setStatus("")
         NSSound(named: "Tink")?.play()
         refreshActions()
     }
@@ -444,6 +545,12 @@ if args.count >= 3, args[1] == "--decode" {
         let actions = Payload.actions(text).map(\.title).joined(separator: " | ")
         print("\(path)\t\(symbologyName(code.symbology))\t\(Payload.kind(text))\t[\(actions)]\t\(text.debugDescription)")
     }
+    exit(0)
+}
+
+if args.count == 4, args[1] == "--screenshot" {
+    _ = NSApplication.shared
+    AppDelegate().renderScreenshot(scene: args[3], out: args[2])
     exit(0)
 }
 
