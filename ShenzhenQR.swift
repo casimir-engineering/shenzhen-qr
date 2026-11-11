@@ -232,13 +232,26 @@ struct Detection {
     }
 }
 
+/// The middle of the picture, 1/zoom of its width and height, as fractions from the top-left corner.
+func zoomRegion(_ zoom: Double) -> CGRect? {
+    guard zoom > 1.001 else { return nil }
+    let side = 1 / zoom
+    return CGRect(x: (1 - side) / 2, y: (1 - side) / 2, width: side, height: side)
+}
+
 /// Every code Vision reads in the picture, biggest first. `types` limits the code types (nil: all of them).
-func detect(_ handler: VNImageRequestHandler, types: [VNBarcodeSymbology]? = nil) -> [Detection] {
+/// `region` (fractions of the picture from its top-left corner) reads only that part, closer up: smaller codes are
+/// found there. Positions always come back as fractions of the whole picture.
+func detect(_ handler: VNImageRequestHandler, types: [VNBarcodeSymbology]? = nil, region: CGRect? = nil) -> [Detection] {
     let request = VNDetectBarcodesRequest()
     if let types { request.symbologies = types }
+    let roi = region?.intersection(CGRect(x: 0, y: 0, width: 1, height: 1)) ?? CGRect(x: 0, y: 0, width: 1, height: 1)
+    guard roi.width > 0, roi.height > 0 else { return [] }
+    // Vision counts from the bottom-left corner, and answers within the region.
+    request.regionOfInterest = CGRect(x: roi.minX, y: 1 - roi.maxY, width: roi.width, height: roi.height)
     do { try handler.perform([request]) } catch { return [] }
     var seen = Set<String>()
-    let top = { (p: CGPoint) in CGPoint(x: p.x, y: 1 - p.y) }   // Vision counts from the bottom-left corner
+    let top = { (p: CGPoint) in CGPoint(x: roi.minX + p.x * roi.width, y: roi.minY + (1 - p.y) * roi.height) }
     return (request.results ?? []).compactMap { o -> Detection? in
         guard let text = o.payloadStringValue, !text.isEmpty else { return nil }
         let d = Detection(text: text, symbology: o.symbology,
@@ -279,6 +292,12 @@ enum Settings {
         get { let v = defaults.integer(forKey: "cores"); return v > 0 ? min(v, maxCores) : 4 }
         set { defaults.set(newValue, forKey: "cores") }
     }
+    static let maxZoom = 5.0
+    /// The window's zoom into the middle of the camera picture (1 = none).
+    static var zoom: Double {
+        get { let z = defaults.double(forKey: "zoom"); return z >= 1 ? min(z, maxZoom) : 1 }
+        set { defaults.set(min(max(newValue, 1), maxZoom), forKey: "zoom") }
+    }
     static var camera: String? {
         get { defaults.string(forKey: "camera") }
         set { defaults.set(newValue, forKey: "camera") }
@@ -293,6 +312,8 @@ final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     private let workers = DispatchQueue(label: "decode", qos: .userInitiated, attributes: .concurrent)
     private var inFlight = 0, reportSize = true      // touched on `queue` only
     var cores = Settings.cores                       // frames read at the same time
+    /// The part of each frame to read, as fractions from its top-left corner (nil: all of it). Given the frame size.
+    var region: ((CGSize) -> CGRect?)?
     var types: [VNBarcodeSymbology]?
     /// On the main queue: the codes in a frame (only frames that have some) and the frame's size in pixels.
     var onCodes: (([Detection], CGSize) -> Void)?
@@ -328,9 +349,9 @@ final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
         if reportSize { reportSize = false; DispatchQueue.main.async { self.onSize?(size) } }
         guard inFlight < max(1, cores) else { return }   // every worker busy: skip this frame
         inFlight += 1
-        let types = self.types
+        let types = self.types, part = region?(size)
         workers.async { [self] in
-            let found = detect(VNImageRequestHandler(cvPixelBuffer: pixels, options: [:]), types: types)
+            let found = detect(VNImageRequestHandler(cvPixelBuffer: pixels, options: [:]), types: types, region: part)
             queue.async { self.inFlight -= 1 }
             if !found.isEmpty { DispatchQueue.main.async { self.onCodes?(found, size) } }
         }
@@ -343,7 +364,9 @@ final class MarkerView: NSView {
     var selected: String? { didSet { needsDisplay = true } }
     var imageSize = CGSize(width: 16, height: 9)
     var mirrored = false
+    var zoom = 1.0 { didSet { needsDisplay = true } }
     var onPick: ((Detection) -> Void)?
+    var onDoubleClick: (() -> Void)?
 
     func fitRect() -> CGRect {
         guard imageSize.width > 0, imageSize.height > 0 else { return bounds }
@@ -354,8 +377,10 @@ final class MarkerView: NSView {
 
     func outline(_ d: Detection) -> NSBezierPath {
         let r = fitRect()
+        let z = CGFloat(zoom), c = CGPoint(x: bounds.midX, y: bounds.midY)
         let points = d.corners.map { p in
-            CGPoint(x: r.minX + (mirrored ? 1 - p.x : p.x) * r.width, y: r.maxY - p.y * r.height)
+            let q = CGPoint(x: r.minX + (mirrored ? 1 - p.x : p.x) * r.width, y: r.maxY - p.y * r.height)
+            return CGPoint(x: c.x + (q.x - c.x) * z, y: c.y + (q.y - c.y) * z)   // zoomed about the middle
         }
         let path = NSBezierPath()
         path.move(to: points[0]); points.dropFirst().forEach { path.line(to: $0) }; path.close()
@@ -379,6 +404,7 @@ final class MarkerView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        if event.clickCount == 2 { onDoubleClick?(); return }
         let p = convert(event.locationInWindow, from: nil)
         if let d = detections.first(where: { outline($0).contains(p) }) { onPick?(d) }
     }
@@ -387,20 +413,76 @@ final class MarkerView: NSView {
 final class PreviewView: NSView {
     let layerPreview: AVCaptureVideoPreviewLayer
     let markers = MarkerView()
+    let zoomSlider = NSSlider(value: 1, minValue: 1, maxValue: Settings.maxZoom, target: nil, action: nil)
+    let zoomLabel = NSTextField(labelWithString: "1×")
+    let zoomBar = NSVisualEffectView()
+    var stillImage: NSImageView?           // the README screenshot's picture, in place of the camera
+    var zoom = 1.0 {
+        didSet {
+            CATransaction.begin(); CATransaction.setAnimationDuration(0.15)
+            layerPreview.setAffineTransform(CGAffineTransform(scaleX: zoom, y: zoom))
+            CATransaction.commit()
+            needsLayout = true
+            markers.zoom = zoom
+            zoomSlider.doubleValue = zoom
+            zoomLabel.stringValue = String(format: zoom < 1.05 ? "1×" : "%.1f×", zoom)
+        }
+    }
     init(session: AVCaptureSession) {
         layerPreview = AVCaptureVideoPreviewLayer(session: session)
         super.init(frame: .zero)
         wantsLayer = true
         layer = CALayer()
         layer?.backgroundColor = NSColor.black.cgColor
+        layer?.masksToBounds = true
         layerPreview.videoGravity = .resizeAspect
         layer?.addSublayer(layerPreview)
         markers.frame = bounds
         markers.autoresizingMask = [.width, .height]
         addSubview(markers)
+
+        // The zoom control, at the bottom of the picture: − slider + and the factor.
+        let minus = NSButton(title: "−", target: self, action: #selector(zoomOut))
+        let plus = NSButton(title: "+", target: self, action: #selector(zoomIn))
+        for b in [minus, plus] { b.isBordered = false; b.font = .systemFont(ofSize: 15, weight: .medium); b.contentTintColor = .white }
+        zoomSlider.target = self; zoomSlider.action = #selector(slid)
+        zoomSlider.controlSize = .small
+        zoomSlider.widthAnchor.constraint(equalToConstant: 110).isActive = true
+        zoomLabel.textColor = .white
+        zoomLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        zoomLabel.widthAnchor.constraint(equalToConstant: 30).isActive = true
+        let row = NSStackView(views: [minus, zoomSlider, plus, zoomLabel])
+        row.spacing = 6
+        row.edgeInsets = NSEdgeInsets(top: 3, left: 10, bottom: 3, right: 8)
+        zoomBar.material = .hudWindow; zoomBar.state = .active; zoomBar.blendingMode = .withinWindow
+        zoomBar.appearance = NSAppearance(named: .darkAqua)
+        zoomBar.wantsLayer = true; zoomBar.layer?.cornerRadius = 8
+        zoomBar.toolTip = "Zoom into the middle: codes there are read closer up. Double-click the picture to zoom in or out."
+        row.translatesAutoresizingMaskIntoConstraints = false
+        zoomBar.addSubview(row)
+        zoomBar.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(zoomBar)
+        NSLayoutConstraint.activate([
+            row.topAnchor.constraint(equalTo: zoomBar.topAnchor), row.bottomAnchor.constraint(equalTo: zoomBar.bottomAnchor),
+            row.leadingAnchor.constraint(equalTo: zoomBar.leadingAnchor), row.trailingAnchor.constraint(equalTo: zoomBar.trailingAnchor),
+            zoomBar.centerXAnchor.constraint(equalTo: centerXAnchor),
+            zoomBar.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
+        ])
     }
+
+    var onZoom: ((Double) -> Void)?
+    @objc func slid() { onZoom?((zoomSlider.doubleValue * 10).rounded() / 10) }
+    @objc func zoomIn() { onZoom?(min(Settings.maxZoom, (zoom * 2 + 0.001).rounded(.down) / 2 + 0.5)) }
+    @objc func zoomOut() { onZoom?(max(1, (zoom * 2 - 0.001).rounded(.up) / 2 - 0.5)) }
     required init?(coder: NSCoder) { fatalError() }
-    override func layout() { super.layout(); layerPreview.frame = bounds; markers.frame = bounds }
+    override func layout() {
+        super.layout()
+        // bounds and position, not frame: the layer is scaled for the zoom.
+        layerPreview.bounds = CGRect(origin: .zero, size: bounds.size)
+        layerPreview.position = CGPoint(x: bounds.midX, y: bounds.midY)
+        markers.frame = bounds
+        stillImage?.frame = bounds.insetBy(dx: -bounds.width * (zoom - 1) / 2, dy: -bounds.height * (zoom - 1) / 2)
+    }
 }
 
 // MARK: - Installing from the disk image
@@ -477,7 +559,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
     let scanner = Scanner()
     var window: NSWindow!
     let cameraMenu = NSPopUpButton()
-    let sizeLabel = NSTextField(labelWithString: "")
+    let resolutionMenu = NSPopUpButton()
+    var frameSize: CGSize?
     let kindLabel = NSTextField(labelWithString: "")
     let statusLabel = NSTextField(labelWithString: "")
     let textView = NSTextView()
@@ -494,8 +577,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
         Installer.ejectInstallerDisk()
         buildWindow()
         scanner.onCodes = { [weak self] codes, size in self?.found(codes, size: size) }
-        scanner.onSize = { [weak self] size in self?.sizeLabel.stringValue = "\(Int(size.width)) × \(Int(size.height))" }
+        scanner.onSize = { [weak self] size in self?.frameSize = size; self?.refreshResolutionMenu() }
+        scanner.region = { _ in zoomRegion(Settings.zoom) }
         preview.markers.onPick = { [weak self] d in self?.show(d) }
+        preview.markers.onDoubleClick = { [weak self] in self?.setZoom(Settings.zoom > 1.05 ? 1 : 2.5) }
+        preview.onZoom = { [weak self] z in self?.setZoom(z) }
+        preview.zoom = Settings.zoom
         NSApp.activate(ignoringOtherApps: true)
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized: reloadCameras()
@@ -521,7 +608,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
 
         preview = PreviewView(session: scanner.session)
         cameraMenu.target = self; cameraMenu.action = #selector(cameraChosen)
-        sizeLabel.textColor = .secondaryLabelColor
+        resolutionMenu.target = self; resolutionMenu.action = #selector(resolutionChosen)
+        resolutionMenu.toolTip = "Camera resolution"
+        refreshResolutionMenu()
         kindLabel.font = .systemFont(ofSize: 12, weight: .semibold)
         kindLabel.textColor = .secondaryLabelColor
         statusLabel.textColor = .secondaryLabelColor
@@ -543,7 +632,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
         let bottom = NSStackView(views: [buttons, NSView(), copyButton])
         bottom.orientation = .horizontal
 
-        let top = NSStackView(views: [NSTextField(labelWithString: "Camera:"), cameraMenu, NSView(), sizeLabel])
+        let top = NSStackView(views: [NSTextField(labelWithString: "Camera:"), cameraMenu, NSView(), resolutionMenu])
         top.orientation = .horizontal
         let header = NSStackView(views: [kindLabel, NSView(), statusLabel])
         header.orientation = .horizontal
@@ -568,7 +657,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
 
     /// The README's screenshot: the window as it looks after reading `scene`, a picture standing in for the camera.
     /// Drawn off screen; no camera, no clipboard.
-    func renderScreenshot(scene: String, out: String) {
+    func renderScreenshot(scene: String, out: String, zoom: Double = 1) {
         offscreen = true
         NSApp.appearance = NSAppearance(named: .aqua)
         buildWindow()
@@ -579,18 +668,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
         imageView.frame = preview.bounds
         imageView.autoresizingMask = [.width, .height]
         preview.addSubview(imageView, positioned: .below, relativeTo: preview.markers)
+        preview.stillImage = imageView
+        preview.zoom = zoom
         cameraMenu.addItem(withTitle: "FaceTime HD Camera")
         let ci = CIImage(contentsOf: URL(fileURLWithPath: scene))!
-        sizeLabel.stringValue = "\(Int(ci.extent.width)) × \(Int(ci.extent.height))"
-        let codes = detect(VNImageRequestHandler(ciImage: ci, options: [:]))
+        frameSize = ci.extent.size
+        refreshResolutionMenu()
+        let codes = detect(VNImageRequestHandler(ciImage: ci, options: [:]), region: zoomRegion(zoom))
         preview.markers.imageSize = ci.extent.size
         preview.markers.detections = codes
         if let d = codes.first { show(d, sound: false) }
         setStatus("")
         let content = window.contentView!
         content.layoutSubtreeIfNeeded()
-        imageView.frame = preview.bounds
-        preview.markers.frame = preview.bounds
+        preview.layout()
         content.displayIfNeeded()
         let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds)!
         content.cacheDisplay(in: content.bounds, to: rep)
@@ -601,7 +692,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
         cameras = Scanner.cameras()
         cameraMenu.removeAllItems()
         cameraMenu.addItems(withTitles: cameras.map(\.localizedName))
-        guard !cameras.isEmpty else { statusLabel.stringValue = "No camera found"; sizeLabel.stringValue = ""; return }
+        guard !cameras.isEmpty else { statusLabel.stringValue = "No camera found"; return }
         let index = cameras.firstIndex { $0.uniqueID == Settings.camera } ?? 0
         cameraMenu.selectItem(at: index)
         startCamera()
@@ -624,11 +715,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
 
     /// The Settings window changed something: use it now.
     func settingsChanged() {
-        if !cameras.isEmpty { startCamera() }
+        refreshResolutionMenu()
+        if !cameras.isEmpty { frameSize = nil; refreshResolutionMenu(); startCamera() }
+    }
+
+    /// The resolutions, the chosen one with the size the camera actually gives when that differs from its name.
+    func refreshResolutionMenu() {
+        resolutionMenu.removeAllItems()
+        let chosen = offscreen ? "auto" : Settings.resolution   // the screenshot shows the default
+        for r in Settings.resolutions {
+            var title = r.title
+            if r.key == chosen, let size = frameSize {
+                let actual = "\(Int(size.width)) × \(Int(size.height))"
+                if r.key == "auto" { title = "Automatic · \(actual)" }
+                else if actual != r.title { title = "\(r.title) (camera gives \(actual))" }
+            }
+            resolutionMenu.addItem(withTitle: title)
+        }
+        resolutionMenu.selectItem(at: Settings.resolutions.firstIndex { $0.key == chosen } ?? 0)
+    }
+
+    @objc func resolutionChosen() {
+        Settings.resolution = Settings.resolutions[resolutionMenu.indexOfSelectedItem].key
+        settingsWindow?.reload()
+        settingsChanged()
+    }
+
+    func setZoom(_ z: Double) {
+        Settings.zoom = z
+        preview.zoom = Settings.zoom
+        preview.markers.detections = []
     }
 
     @objc func openSettings() {
         if settingsWindow == nil { settingsWindow = SettingsWindow() }
+        settingsWindow?.reload()
         settingsWindow?.showWindow(nil)
         settingsWindow?.window?.makeKeyAndOrderFront(nil)
     }
@@ -738,6 +859,11 @@ final class SettingsWindow: NSWindowController {
         w.center()
     }
 
+    func reload() {
+        resolution.selectItem(at: Settings.resolutions.firstIndex { $0.key == Settings.resolution } ?? 0)
+        cores.selectItem(at: Settings.cores - 1)
+    }
+
     @objc func changed() {
         Settings.resolution = Settings.resolutions[resolution.indexOfSelectedItem].key
         Settings.cores = cores.indexOfSelectedItem + 1
@@ -765,6 +891,7 @@ enum CLI {
       shenzhenqr settings [<name> <value>]    Show the settings, or change one (shared with the app):
                                                 resolution  auto, 480p, 720p, 1080p or 4k
                                                 cores       frames or pictures read at the same time (default 4)
+                                                zoom        the window's zoom into the middle, 1 to 5 (camera uses it too)
                                                 camera      a camera's name or ID, or auto
       shenzhenqr types                        List the code types
 
@@ -775,14 +902,19 @@ enum CLI {
       --types <list>      Only these code types, comma-separated (shenzhenqr types lists them): --types qr,ean13
       --cores <n>         Pictures or frames read at the same time (default: the settings, 4)
       --copy              Also copy the first code's text to the clipboard
+      --region <x,y,w,h>  Read only this part: pixels from the top-left corner (100,50,400,300), or fractions of
+                          the picture when all four are 1 or less (0.25,0.25,0.5,0.5). Smaller codes are found there.
+      --zoom <factor>     Read only the middle, 1/factor of the width and height (2.5 reads the middle 40%)
       camera only:
       --camera <name|id>  The camera to use (default: the one chosen in the app)
       --resolution <r>    auto, 480p, 720p, 1080p or 4k (default: the settings)
       --once              Stop after the first code
       --timeout <s>       Give up after this many seconds
+                          (the camera reads the middle at the app's zoom unless --zoom or --region says otherwise)
 
     Positions are in pixels from the picture's top-left corner: "box" is the rectangle around the code, "corners"
-    its four corners (top-left, top-right, bottom-right, bottom-left, as the code is printed).
+    its four corners (top-left, top-right, bottom-right, bottom-left, as the code is printed), always in the whole
+    picture, also with --region or --zoom ("region" in --json says which part was read).
 
     Exit status: 0 a code was read, 1 none was, 2 the command was wrong, 3 the camera can't be used.
     The camera needs the terminal app to be allowed in System Settings › Privacy & Security › Camera.
@@ -794,7 +926,19 @@ enum CLI {
         var cores = Settings.cores
         var camera: String?, resolution: String?
         var timeout: Double?
+        var zoom: Double?
+        var region: [Double]?           // x, y, width, height: pixels, or fractions when all are 1 or less
         var rest: [String] = []
+
+        /// The part of a picture of this size to read, as fractions from its top-left corner (nil: all of it).
+        func part(_ size: CGSize, defaultZoom: Double) -> CGRect? {
+            if let r = region {
+                let fractions = r.allSatisfy { $0 <= 1 }
+                let (w, h) = fractions ? (1.0, 1.0) : (Double(size.width), Double(size.height))
+                return CGRect(x: r[0] / w, y: r[1] / h, width: r[2] / w, height: r[3] / h)
+            }
+            return zoomRegion(zoom ?? defaultZoom)
+        }
     }
 
     static func fail(_ message: String, _ code: Int32 = 2) -> Never {
@@ -826,6 +970,15 @@ enum CLI {
                     return known[key] ?? failed("Unknown code type “\(name)”. shenzhenqr types lists them.")
                 }
             case "--camera": o.camera = value(a)
+            case "--zoom":
+                guard let z = Double(value(a)), z >= 1, z <= 20 else { fail("--zoom needs a factor from 1 to 20, such as 2.5") }
+                o.zoom = z
+            case "--region":
+                let parts = value(a).split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+                guard parts.count == 4, parts.allSatisfy({ $0 >= 0 }), parts[2] > 0, parts[3] > 0 else {
+                    fail("--region is x,y,width,height: pixels from the top-left corner (100,50,400,300), or fractions (0.25,0.25,0.5,0.5)")
+                }
+                o.region = parts
             case "--resolution":
                 let r = value(a).lowercased()
                 guard Settings.resolutions.contains(where: { $0.key == r }) else { fail("--resolution is auto, 480p, 720p, 1080p or 4k") }
@@ -846,7 +999,7 @@ enum CLI {
         String(decoding: try! JSONSerialization.data(withJSONObject: v, options: [.sortedKeys, .withoutEscapingSlashes]), as: UTF8.self)
     }
 
-    static func record(_ d: Detection, size: CGSize, source: String) -> [String: Any] {
+    static func record(_ d: Detection, size: CGSize, source: String, part: CGRect?) -> [String: Any] {
         // Decimal keeps JSON at the digits given (513.1, not 513.10000000000002).
         let num = { (v: Double, digits: Int) in Decimal(string: String(format: "%.\(digits)f", v))! }
         let px = { (p: CGPoint) -> [Decimal] in [num(p.x * size.width, 1), num(p.y * size.height, 1)] }
@@ -861,11 +1014,15 @@ enum CLI {
             "corners": ["top_left": px(d.corners[0]), "top_right": px(d.corners[1]),
                         "bottom_right": px(d.corners[2]), "bottom_left": px(d.corners[3])],
             "confidence": num(Double(d.confidence), 3),
+            "region": part.map { r -> Any in
+                ["x": Int((r.minX * size.width).rounded()), "y": Int((r.minY * size.height).rounded()),
+                 "width": Int((r.width * size.width).rounded()), "height": Int((r.height * size.height).rounded())]
+            } ?? NSNull(),
         ]
     }
 
-    static func printCode(_ d: Detection, size: CGSize, source: String, o: Options) {
-        if o.json { print(jsonString(record(d, size: size, source: source))); return }
+    static func printCode(_ d: Detection, size: CGSize, source: String, o: Options, part: CGRect?) {
+        if o.json { print(jsonString(record(d, size: size, source: source, part: part))); return }
         if o.text { print(d.text); return }
         let b = d.box
         let x = Int((b.minX * size.width).rounded()), y = Int((b.minY * size.height).rounded())
@@ -884,14 +1041,15 @@ enum CLI {
 
     static func scan(_ o: Options) -> Never {
         guard !o.rest.isEmpty else { fail("Which pictures? shenzhenqr scan <picture>...") }
-        var results = [(size: CGSize, codes: [Detection])?](repeating: nil, count: o.rest.count)
+        var results = [(size: CGSize, codes: [Detection], part: CGRect?)?](repeating: nil, count: o.rest.count)
         let lock = NSLock(), queue = OperationQueue()
         queue.maxConcurrentOperationCount = o.cores
         for (i, path) in o.rest.enumerated() {
             queue.addOperation {
                 guard let image = loadImage(path) else { return }
-                let codes = detect(VNImageRequestHandler(ciImage: image, options: [:]), types: o.types)
-                lock.lock(); results[i] = (image.extent.size, codes); lock.unlock()
+                let part = o.part(image.extent.size, defaultZoom: 1)
+                let codes = detect(VNImageRequestHandler(ciImage: image, options: [:]), types: o.types, region: part)
+                lock.lock(); results[i] = (image.extent.size, codes, part); lock.unlock()
             }
         }
         queue.waitUntilAllOperationsAreFinished()
@@ -901,7 +1059,7 @@ enum CLI {
             if result.codes.isEmpty, !o.json, !o.text { FileHandle.standardError.write("\(path): no code found\n".data(using: .utf8)!) }
             for d in (o.first ? Array(result.codes.prefix(1)) : result.codes) {
                 any = true; first = first ?? d.text
-                printCode(d, size: result.size, source: path == "-" ? "stdin" : path, o: o)
+                printCode(d, size: result.size, source: path == "-" ? "stdin" : path, o: o, part: result.part)
             }
         }
         if o.copy, let first { Payload.copy(first) }
@@ -930,6 +1088,7 @@ enum CLI {
             let scanner = Scanner()
             scanner.cores = o.cores
             scanner.types = o.types
+            scanner.region = { size in o.part(size, defaultZoom: Settings.zoom) }
             var last: [String: Date] = [:], copied = false
             scanner.onCodes = { codes, size in
                 for d in (o.first ? Array(codes.prefix(1)) : codes) {
@@ -937,7 +1096,7 @@ enum CLI {
                     let seen = last[d.text].map { Date().timeIntervalSince($0) < 3 } ?? false
                     last[d.text] = Date()
                     if seen { continue }
-                    printCode(d, size: size, source: device.localizedName, o: o)
+                    printCode(d, size: size, source: device.localizedName, o: o, part: o.part(size, defaultZoom: Settings.zoom))
                     fflush(stdout)
                     if o.copy, !copied { Payload.copy(d.text); copied = true }
                     if o.once { exit(0) }
@@ -1004,10 +1163,11 @@ enum CLI {
             let cam = Scanner.cameras().first { $0.uniqueID == Settings.camera }
             print("resolution\t\(r.key)\t\(r.title)")
             print("cores\t\(Settings.cores)")
+            print("zoom\t\(Settings.zoom)")
             print("camera\t\(Settings.camera ?? "auto")\t\(cam?.localizedName ?? "the first camera found")")
             exit(0)
         }
-        guard o.rest.count == 2 else { fail("shenzhenqr settings <name> <value>: resolution, cores or camera") }
+        guard o.rest.count == 2 else { fail("shenzhenqr settings <name> <value>: resolution, cores, zoom or camera") }
         let value = o.rest[1]
         switch o.rest[0] {
         case "resolution":
@@ -1018,7 +1178,10 @@ enum CLI {
             Settings.cores = n
         case "camera":
             Settings.camera = value == "auto" ? nil : pickCamera(value).uniqueID
-        default: fail("No setting “\(o.rest[0])”: resolution, cores or camera")
+        case "zoom":
+            guard let z = Double(value), (1...Settings.maxZoom).contains(z) else { fail("zoom is a factor from 1 to \(Int(Settings.maxZoom))") }
+            Settings.zoom = z
+        default: fail("No setting “\(o.rest[0])”: resolution, cores, zoom or camera")
         }
         exit(0)
     }
@@ -1043,7 +1206,7 @@ enum CLI {
             print("ShenzhenQR \(appBundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")")
             exit(0)
         case "--screenshot":
-            guard args.count == 4 else { fail("--screenshot <out.png> <picture|settings>") }
+            guard args.count >= 4 else { fail("--screenshot <out.png> <picture|settings> [zoom]") }
             _ = NSApplication.shared
             if args[3] == "settings" {
                 NSApp.appearance = NSAppearance(named: .aqua)
@@ -1054,7 +1217,7 @@ enum CLI {
                 try! rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: args[2]))
                 exit(0)
             }
-            AppDelegate().renderScreenshot(scene: args[3], out: args[2])
+            AppDelegate().renderScreenshot(scene: args[3], out: args[2], zoom: args.count > 4 ? Double(args[4]) ?? 1 : 1)
             exit(0)
         default:
             print(help)
