@@ -11,7 +11,8 @@ Apple Silicon · macOS 14+ · Signed and notarized
 - **Any camera.** Pick it from the menu at the top; ShenzhenQR remembers your choice and notices cameras being plugged in or removed. The menu beside it lists the picture sizes that camera has.
 - **Zoom for small codes.** Double-click the picture to zoom 2.5× into the middle, and again to zoom out, or use the zoom bar at the bottom of the picture. Only the middle is read then, closer up, so smaller codes are found.
 - **Every common code.** QR, Micro QR, Aztec, Data Matrix, PDF417, EAN and UPC, Code 128, 39 and 93, ITF, Codabar and GS1 DataBar.
-- **Photo and text.** **Photo** freezes the picture and reads the text in it, Chinese included: select text right on the photo, as in Preview, or edit all of it in the field below. **Back to Camera** returns.
+- **Photo and text.** **Photo** freezes the picture and reads the text in it, Chinese included: select text right on the photo, as in Preview, or edit all of it in the field below. Codes on the photo are outlined too; click one to put it in the field. **Back to Camera** returns.
+- **Blurred barcodes.** On a photo or a picture, when a barcode's bars are too blurred to read, its number is read from the digits printed under it, and kept only if its check digit is right (dashed outline). A camera can't focus up close: hold the code farther away and zoom in instead.
 - **See where it is.** A green outline marks each code where it was read. With several in view, click one to use it.
 - **Settings** (⌘,): the camera resolution, and how many processor cores read frames at the same time (4 unless you change it).
 - **The text, ready to use.** What the code holds appears in a field you can select and edit. **Copy** puts it on the clipboard.

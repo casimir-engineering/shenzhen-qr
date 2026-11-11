@@ -206,6 +206,11 @@ enum Payload {
     }
 }
 
+/// The code type's name, saying UPC-A for a 12-digit EAN-13 number.
+func codeName(_ d: Detection) -> String {
+    d.symbology == .ean13 && d.text.count == 12 ? "UPC-A" : symbologyName(d.symbology)
+}
+
 func symbologyName(_ s: VNBarcodeSymbology) -> String {
     let names: [VNBarcodeSymbology: String] = [
         .qr: "QR code", .microQR: "Micro QR code", .aztec: "Aztec code", .pdf417: "PDF417", .microPDF417: "MicroPDF417",
@@ -227,6 +232,7 @@ struct Detection {
     let symbology: VNBarcodeSymbology
     let corners: [CGPoint]          // top-left, top-right, bottom-right, bottom-left
     let confidence: Float
+    var printed = false             // read from the digits printed under the bars, not from the bars
     var box: CGRect {
         let xs = corners.map(\.x), ys = corners.map(\.y)
         return CGRect(x: xs.min()!, y: ys.min()!, width: xs.max()! - xs.min()!, height: ys.max()! - ys.min()!)
@@ -288,6 +294,58 @@ func recognizeText(_ handler: VNImageRequestHandler, region: CGRect? = nil) -> [
         return TextLine(text: best.string, confidence: best.confidence,
                         corners: [top(o.topLeft), top(o.topRight), top(o.bottomRight), top(o.bottomLeft)])
     }
+}
+
+/// Barcode numbers read from the digits printed under the bars, for when the bars themselves are too blurred: a
+/// line of 13 (EAN-13), 12 (UPC-A) or 8 (EAN-8) digits whose check digit is right. A 12-digit line that isn't a UPC-A
+/// number is an EAN-13 whose first digit, printed apart, wasn't read: the check digit allows only one, so it's put back.
+func printedBarcodes(_ lines: [TextLine]) -> [Detection] {
+    func checks(_ d: [Int]) -> Bool {          // EAN/UPC: weights 3,1,3,1… from the right, after the check digit
+        let body = d.dropLast().reversed().enumerated().map { $0.offset % 2 == 0 ? $0.element * 3 : $0.element }
+        return (10 - body.reduce(0, +) % 10) % 10 == d.last!
+    }
+    var out: [Detection] = []
+    for line in lines {
+        // The digits only, when the line is nothing but digits and spaces (as printed under a barcode).
+        let t = line.text.replacingOccurrences(of: " ", with: "")
+        guard !t.isEmpty, t.allSatisfy(\.isASCII), t.allSatisfy(\.isNumber) else { continue }
+        var d = t.compactMap { $0.wholeNumberValue }
+        var symbology: VNBarcodeSymbology
+        switch d.count {
+        case 13 where checks(d): symbology = .ean13
+        case 12 where checks(d): symbology = .ean13; d.insert(0, at: 0)    // UPC-A is EAN-13 with a leading 0
+        case 12:
+            guard let first = (0...9).first(where: { checks([$0] + d) }) else { continue }
+            d.insert(first, at: 0); symbology = .ean13
+        case 8 where checks(d): symbology = .ean8
+        default: continue
+        }
+        let text = d.map(String.init).joined()
+        out.append(Detection(text: d.count == 13 && d[0] == 0 && t.count == 12 ? String(text.dropFirst()) : text,
+                             symbology: symbology, corners: line.corners, confidence: line.confidence, printed: true))
+    }
+    return out
+}
+
+/// Codes in a still picture, trying harder than for a camera frame: if nothing is read as it is, then grey with
+/// more contrast and sharpened, then twice as big. Last, barcode numbers from their printed digits.
+func detectInPhoto(_ image: CGImage, types: [VNBarcodeSymbology]? = nil, region: CGRect? = nil) -> [Detection] {
+    detectInPhoto(CIImage(cgImage: image), types: types, region: region)
+}
+
+func detectInPhoto(_ ci: CIImage, types: [VNBarcodeSymbology]? = nil, region: CGRect? = nil) -> [Detection] {
+    let gray = ci.applyingFilter("CIColorControls", parameters: ["inputSaturation": 0, "inputContrast": 1.5])
+    let variants = [ci,
+                    gray.applyingFilter("CIUnsharpMask", parameters: ["inputRadius": 4, "inputIntensity": 1.2]),
+                    gray.applyingFilter("CILanczosScaleTransform", parameters: ["inputScale": 2])
+                        .applyingFilter("CIUnsharpMask", parameters: ["inputRadius": 8, "inputIntensity": 1.2])]
+    for v in variants {
+        // Positions are fractions of the picture, so they hold for the enlarged one too.
+        let found = detect(VNImageRequestHandler(ciImage: v, options: [:]), types: types, region: region)
+        if !found.isEmpty { return found }
+    }
+    let printed = printedBarcodes(recognizeText(VNImageRequestHandler(ciImage: ci, options: [:]), region: region))
+    return printed.filter { types?.contains($0.symbology) ?? true }
 }
 
 // MARK: - Settings
@@ -393,13 +451,15 @@ final class Scanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
                 if session.canAddOutput(out) { session.addOutput(out) }
             }
             if let input = try? AVCaptureDeviceInput(device: device), session.canAddInput(input) { session.addInput(input) }
-            session.sessionPreset = .high
-            if let size = Settings.parseSize(resolution), let format = Settings.format(device, size),
-               (try? device.lockForConfiguration()) != nil {
-                device.activeFormat = format          // the session follows the device's format from here
+            let size = Settings.parseSize(resolution), format = size.flatMap { Settings.format(device, $0) }
+            if format == nil { session.sessionPreset = .high }
+            session.commitConfiguration()
+            // A chosen size: the device's format, set after the configuration (a preset applied at commit would
+            // replace it). The session then follows the device.
+            if let format, (try? device.lockForConfiguration()) != nil {
+                device.activeFormat = format
                 device.unlockForConfiguration()
             }
-            session.commitConfiguration()
             reportSize = true
             if !session.isRunning { session.startRunning() }
         }
@@ -482,6 +542,7 @@ final class MarkerView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         for d in detections {
             let path = outline(d), chosen = d.text == selected
+            if d.printed { path.setLineDash([6, 4], count: 2, phase: 0) }
             NSColor.systemGreen.withAlphaComponent(chosen ? 0.22 : 0.12).setFill()
             path.fill()
             NSColor.systemGreen.setStroke()
@@ -489,6 +550,16 @@ final class MarkerView: NSView {
             path.lineJoinStyle = .round
             path.stroke()
         }
+    }
+
+    /// Clicks reach the markers only; elsewhere they go to what's under (the photo's selectable text). Double-clicks
+    /// on the camera picture still come here, for the zoom.
+    var passThrough = false
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard !isHidden else { return nil }
+        let p = convert(point, from: superview)
+        if detections.contains(where: { outline($0).contains(p) }) { return self }
+        return passThrough ? nil : super.hitTest(point)
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -857,48 +928,120 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
         showPhoto(image)
     }
 
+    var photoCodes: [Detection] = [], photoText: String?, photoLines: [TextLine] = []
+
     @MainActor func showPhoto(_ image: CGImage) {
         scanner.paused = true
         markerTimer?.invalidate()
-        preview.markers.detections = []
-        preview.markers.isHidden = true
+        // The markers now outline codes on the photo: its own size, no zoom or mirroring, clicks elsewhere go to
+        // the photo's text.
+        let markers = preview.markers
+        markers.detections = []; markers.selected = nil
+        markers.imageSize = CGSize(width: image.width, height: image.height)
+        markers.zoom = 1; markers.mirrored = false; markers.passThrough = true
         preview.zoomBar.isHidden = true
         preview.layerPreview.isHidden = true
         let view = NSImageView(image: NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height)))
         view.imageScaling = .scaleProportionallyUpOrDown
         view.frame = preview.bounds
         view.autoresizingMask = [.width, .height]
-        preview.addSubview(view, positioned: .below, relativeTo: preview.markers)
+        preview.addSubview(view, positioned: .below, relativeTo: markers)
+        // Live Text, laid over the image view it tracks.
         let overlay = ImageAnalysisOverlayView()
         overlay.trackingImageView = view
         overlay.preferredInteractionTypes = .automatic
-        overlay.frame = preview.bounds
+        overlay.frame = view.bounds
         overlay.autoresizingMask = [.width, .height]
-        preview.addSubview(overlay, positioned: .above, relativeTo: view)
+        view.addSubview(overlay)
         photoView = view; photoOverlay = overlay
+        photoCodes = []; photoText = nil
         photoButton.title = "Back to Camera"
         photoButton.image = NSImage(systemSymbolName: "video", accessibilityDescription: nil)
-        setStatus("Reading the text…")
+        lastCode = ""
+        textView.string = ""; kindLabel.stringValue = ""; setButtons([])
+        setStatus("Reading the photo…")
+        DispatchQueue.global(qos: .userInitiated).async {
+            let codes = detectInPhoto(image)
+            let lines = recognizeText(VNImageRequestHandler(cgImage: image, options: [:]))
+            DispatchQueue.main.async {
+                guard self.photoOverlay === overlay else { return }
+                self.photoLines = lines
+                self.addPhotoCodes(codes)
+                self.addTranscriptCodes()
+                self.photoStatus()
+            }
+        }
         Task { @MainActor in
-            let config = ImageAnalyzer.Configuration([.text, .machineReadableCode])
+            let config = ImageAnalyzer.Configuration([.text])
             let analysis = try? await ImageAnalyzer().analyze(image, orientation: .up, configuration: config)
-            guard let analysis, self.photoOverlay === overlay else { return }
+            guard self.photoOverlay === overlay else { return }
             overlay.analysis = analysis
-            let text = analysis.transcript
-            self.lastCode = ""
-            self.textView.string = text
-            let kind = Payload.kind(text)
-            self.kindLabel.stringValue = text.isEmpty ? "" : kind == "Text" ? "Text in the photo" : "Text in the photo · \(kind)"
-            self.setStatus(text.isEmpty ? "No text found in the photo" : "Select text on the photo, or edit it below")
-            self.refreshActions()
+            let text = analysis?.transcript ?? ""
+            self.photoText = text
+            self.addTranscriptCodes()
+            // The field gets the photo's text, unless a code was clicked meanwhile.
+            if self.lastCode.isEmpty {
+                self.textView.string = text
+                let kind = Payload.kind(text)
+                self.kindLabel.stringValue = text.isEmpty ? "" : kind == "Text" ? "Text in the photo" : "Text in the photo · \(kind)"
+                self.refreshActions()
+            }
+            self.photoStatus()
+        }
+    }
+
+    func addPhotoCodes(_ codes: [Detection]) {
+        let new = codes.filter { c in !photoCodes.contains { $0.text == c.text } }
+        photoCodes += new
+        preview.markers.detections = photoCodes
+    }
+
+    /// Live Text can read a barcode's printed digits better than the other reading: take a barcode number from its
+    /// text too, outlined on the line of the photo whose digits match it best.
+    func addTranscriptCodes() {
+        guard let text = photoText, !photoLines.isEmpty else { return }
+        let digitsOf = { (t: String) in t.filter { $0.isASCII && $0.isNumber } }
+        let candidates = printedBarcodes(text.split(separator: "\n").map {
+            TextLine(text: String($0), confidence: 1, corners: [.zero, .zero, .zero, .zero])
+        })
+        var placed: [Detection] = []
+        for c in candidates {
+            // The line sharing the longest run of digits with the number (at least 5).
+            func shared(_ a: String, _ b: String) -> Int {
+                let a = Array(a), b = Array(b); var best = 0
+                for i in a.indices { for j in b.indices {
+                    var k = 0
+                    while i + k < a.count, j + k < b.count, a[i + k] == b[j + k] { k += 1 }
+                    best = max(best, k)
+                } }
+                return best
+            }
+            let match = photoLines.map { ($0, shared(digitsOf($0.text), c.text)) }.max { $0.1 < $1.1 }
+            guard let (line, n) = match, n >= 5 else { continue }
+            placed.append(Detection(text: c.text, symbology: c.symbology, corners: line.corners, confidence: c.confidence, printed: true))
+        }
+        addPhotoCodes(placed)
+    }
+
+    /// What can be done on the photo, once it's read.
+    func photoStatus() {
+        guard let text = photoText else { return }
+        switch (text.isEmpty, photoCodes.isEmpty) {
+        case (true, true): setStatus("No text or code found in the photo")
+        case (false, true): setStatus("Select text on the photo, or edit it below")
+        case (true, false): setStatus("Click the outlined code to use it")
+        case (false, false): setStatus("Select text on the photo, or click a code to use it")
         }
     }
 
     func closePhoto() {
         photoOverlay?.removeFromSuperview(); photoView?.removeFromSuperview()
-        photoOverlay = nil; photoView = nil
+        photoOverlay = nil; photoView = nil; photoCodes = []; photoText = nil; photoLines = []
+        let markers = preview.markers
+        markers.detections = []; markers.passThrough = false; markers.zoom = preview.zoom
+        markers.mirrored = preview.layerPreview.connection?.isVideoMirrored ?? false
+        if let frameSize { markers.imageSize = frameSize }
         preview.layerPreview.isHidden = false
-        preview.markers.isHidden = false
         preview.zoomBar.isHidden = false
         photoButton.title = "Photo"
         photoButton.image = NSImage(systemSymbolName: "camera", accessibilityDescription: nil)
@@ -949,8 +1092,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
         lastCode = d.text; lastCodeAt = Date()
         preview.markers.selected = d.text
         textView.string = d.text
-        kindLabel.stringValue = "\(symbologyName(d.symbology)) · \(Payload.kind(d.text))"
-        setStatus("")
+        kindLabel.stringValue = d.printed ? "\(codeName(d)) · read from the printed digits"
+                                          : "\(codeName(d)) · \(Payload.kind(d.text))"
+        if photoView == nil { setStatus("") }
         if sound { NSSound(named: "Tink")?.play() }
         refreshActions()
     }
@@ -1086,6 +1230,9 @@ enum CLI {
       --timeout <s>       Give up after this many seconds
                           (the camera reads the middle at the app's zoom unless --zoom or --region says otherwise)
 
+    Pictures are read harder than camera frames: cleaned up when nothing is read at first, and, when a barcode's bars
+    are too blurred, its number is read from the digits printed under it (only when its check digit is right).
+
     Positions are in pixels from the picture's top-left corner: "box" is the rectangle around the code, "corners"
     its four corners (top-left, top-right, bottom-right, bottom-left, as the code is printed), always in the whole
     picture, also with --region or --zoom ("region" in --json says which part was read).
@@ -1207,7 +1354,7 @@ enum CLI {
         let b = d.box
         return [
             "source": source,
-            "type": symbologyKey(d.symbology), "type_name": symbologyName(d.symbology),
+            "type": codeName(d) == "UPC-A" ? "upca" : symbologyKey(d.symbology), "type_name": codeName(d),
             "text": d.text, "kind": Payload.kind(d.text), "actions": Payload.actions(d.text).map(\.title),
             "image": ["width": Int(size.width), "height": Int(size.height)],
             "box": ["x": Int((b.minX * size.width).rounded()), "y": Int((b.minY * size.height).rounded()),
@@ -1215,6 +1362,7 @@ enum CLI {
             "corners": ["top_left": px(d.corners[0]), "top_right": px(d.corners[1]),
                         "bottom_right": px(d.corners[2]), "bottom_left": px(d.corners[3])],
             "confidence": num(Double(d.confidence), 3),
+            "read_from": d.printed ? "printed digits" : "code",
             "region": part.map { r -> Any in
                 ["x": Int((r.minX * size.width).rounded()), "y": Int((r.minY * size.height).rounded()),
                  "width": Int((r.width * size.width).rounded()), "height": Int((r.height * size.height).rounded())]
@@ -1228,7 +1376,7 @@ enum CLI {
         let b = d.box
         let x = Int((b.minX * size.width).rounded()), y = Int((b.minY * size.height).rounded())
         let w = Int((b.width * size.width).rounded()), h = Int((b.height * size.height).rounded())
-        print("\(source): \(symbologyName(d.symbology)) · \(Payload.kind(d.text)) · at x \(x), y \(y), \(w) × \(h) px of \(Int(size.width)) × \(Int(size.height))")
+        print("\(source): \(codeName(d))\(d.printed ? " (read from the printed digits)" : "") · \(Payload.kind(d.text)) · at x \(x), y \(y), \(w) × \(h) px of \(Int(size.width)) × \(Int(size.height))")
         print(d.text.split(separator: "\n", omittingEmptySubsequences: false).map { "  " + $0 }.joined(separator: "\n"))
         let actions = Payload.actions(d.text).map(\.title)
         if !actions.isEmpty { print("  → " + actions.joined(separator: " · ")) }
@@ -1249,7 +1397,7 @@ enum CLI {
             queue.addOperation {
                 guard let image = loadImage(path) else { return }
                 let part = o.part(image.extent.size, defaultZoom: 1)
-                let codes = detect(VNImageRequestHandler(ciImage: image, options: [:]), types: o.types, region: part)
+                let codes = detectInPhoto(image, types: o.types, region: part)
                 lock.lock(); results[i] = (image.extent.size, codes, part); lock.unlock()
             }
         }
@@ -1498,7 +1646,8 @@ enum CLI {
                 let ci = CIImage(contentsOf: URL(fileURLWithPath: args[3]))!
                 MainActor.assumeIsolated { d.showPhoto(cgImage(ci, region: nil)!) }
                 let deadline = Date().addingTimeInterval(20)
-                while d.statusLabel.stringValue == "Reading the text…", Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.1)) }
+                while d.photoText == nil || d.photoLines.isEmpty && Date() < deadline - 15, Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.1)) }
+                RunLoop.main.run(until: Date().addingTimeInterval(0.5))
                 let content = d.window.contentView!
                 content.layoutSubtreeIfNeeded(); content.displayIfNeeded()
                 let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds)!
