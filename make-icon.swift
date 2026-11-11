@@ -29,7 +29,7 @@ func color(_ red: CGFloat, _ green: CGFloat, _ blue: CGFloat, _ alpha: CGFloat =
 }
 
 func documentPath(offsetX: CGFloat = 0, offsetY: CGFloat = 0) -> NSBezierPath {
-    NSBezierPath(roundedRect: rect(200 + offsetX, 200 + offsetY, 624, 624), xRadius: 118 * scale, yRadius: 118 * scale)
+    NSBezierPath(roundedRect: rect(200 + offsetX, 200 + offsetY, 624, 624), xRadius: 30 * scale, yRadius: 30 * scale)
 }
 
 func drawText(_ text: String, y: CGFloat, font: NSFont, tracking: CGFloat = 0) {
@@ -72,9 +72,9 @@ NSColor.clear.setFill()
 canvas.fill()
 
 let backdrop = NSGradient(colorsAndLocations:
-    (color(255, 253, 250), 0.0),
-    (color(255, 235, 211), 0.46),
-    (color(255, 174, 94), 1.0))!
+    (color(255, 251, 250), 0.0),
+    (color(255, 222, 218), 0.46),
+    (color(240, 84, 78), 1.0))!
 backdrop.draw(in: canvas, angle: -38)
 
 let glow = NSGradient(colorsAndLocations:
@@ -111,35 +111,37 @@ topHighlight.lineCapStyle = .round
 color(144, 216, 255, 0.72).setStroke()
 topHighlight.stroke()
 
-// Viewfinder corners
-let corners = NSBezierPath()
+// Viewfinder brackets, inside the tile with space around them.
+let brackets = NSBezierPath()
 let lo: CGFloat = 262, hi: CGFloat = 762, arm: CGFloat = 78
 for (cx, cy, dx, dy) in [(lo, lo, 1.0, 1.0), (hi, lo, -1.0, 1.0), (lo, hi, 1.0, -1.0), (hi, hi, -1.0, -1.0)] as [(CGFloat, CGFloat, CGFloat, CGFloat)] {
-    corners.move(to: point(cx + dx * arm, cy))
-    corners.line(to: point(cx, cy))
-    corners.line(to: point(cx, cy + dy * arm))
+    brackets.move(to: point(cx + dx * arm, cy))
+    brackets.line(to: point(cx, cy))
+    brackets.line(to: point(cx, cy + dy * arm))
 }
-corners.lineWidth = max(1, 20 * scale)
-corners.lineCapStyle = .round
-corners.lineJoinStyle = .round
+brackets.lineWidth = max(1, 20 * scale)
+brackets.lineCapStyle = .round
+brackets.lineJoinStyle = .round
 color(255, 255, 255, 0.92).setStroke()
-corners.stroke()
+brackets.stroke()
 
-if pixelSize >= 64 {
-    let divider = NSBezierPath()
-    divider.move(to: point(372, 428))
-    divider.line(to: point(652, 428))
-    divider.lineWidth = max(1, 4 * scale)
-    divider.lineCapStyle = .round
-    color(203, 235, 255, 0.55).setStroke()
-    divider.stroke()
+// QR finder patterns in three corners, as on a real code: a ring of 7 modules around a 3-module square.
+let module: CGFloat = 11, inset: CGFloat = 96, finder = module * 7
+color(255, 255, 255, 0.95).setFill()
+for (fx, fy) in [(200 + inset, 824 - inset - finder), (824 - inset - finder, 824 - inset - finder), (200 + inset, 200 + inset)] as [(CGFloat, CGFloat)] {
+    let ring = NSBezierPath(roundedRect: rect(fx, fy, finder, finder), xRadius: 16 * scale, yRadius: 16 * scale)
+    ring.append(NSBezierPath(roundedRect: rect(fx + module, fy + module, finder - 2 * module, finder - 2 * module),
+                             xRadius: 6 * scale, yRadius: 6 * scale))
+    ring.windingRule = .evenOdd
+    ring.fill()
+    NSBezierPath(roundedRect: rect(fx + 2 * module, fy + 2 * module, 3 * module, 3 * module), xRadius: 6 * scale, yRadius: 6 * scale).fill()
 }
 
 let hanziFont = NSFont(name: "PingFangSC-Semibold", size: 190 * scale)
     ?? NSFont.systemFont(ofSize: 190 * scale, weight: .bold)
 let pdfFont = NSFont.systemFont(ofSize: 126 * scale, weight: .heavy)
-drawText("深圳", y: 476, font: hanziFont)
-drawText("QR", y: 262, font: pdfFont, tracking: 6)
+drawText("深圳", y: 444, font: hanziFont)
+drawText("QR", y: 214, font: pdfFont, tracking: 6)
 
 NSGraphicsContext.restoreGraphicsState()
 
