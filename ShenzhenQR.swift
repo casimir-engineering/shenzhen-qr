@@ -890,6 +890,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
     var markerTimer: Timer?
     let photoButton = NSButton(title: "Photo", image: NSImage(systemSymbolName: "camera", accessibilityDescription: nil)!,
                                target: nil, action: nil)
+    let openButton = NSButton(image: NSImage(systemSymbolName: "folder", accessibilityDescription: "Open Picture")!,
+                              target: nil, action: nil)
     var photoView: NSImageView?, photoOverlay: ImageAnalysisOverlayView?
     var settingsWindow: SettingsWindow?
 
@@ -909,6 +911,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
         preview.markers.onDoubleClick = { [weak self] in self?.setZoom(Settings.zoom > 1.05 ? 1 : 2.5) }
         preview.onZoom = { [weak self] z in self?.setZoom(z) }
         preview.zoom = Settings.zoom
+        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard event.keyCode == 53, let self, MainActor.assumeIsolated({ self.escape(event) }) else { return event }
+            return nil
+        }
         NSApp.activate(ignoringOtherApps: true)
         // Opened on a picture (Open With in Finder, or a picture dropped on the icon): it shows from the start, and the
         // camera stays off until Back to Camera.
@@ -1026,7 +1032,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
         photoButton.target = self; photoButton.action = #selector(togglePhoto)
         photoButton.imagePosition = .imageLeading
         photoButton.toolTip = "Take a photo and read the text in it. You can then select text on the photo."
-        let top = NSStackView(views: [NSTextField(labelWithString: "Camera:"), cameraMenu, NSView(), resolutionMenu, photoButton])
+        openButton.target = self; openButton.action = #selector(openPicture)
+        openButton.toolTip = "Open a picture and read the codes and text in it (⌘O)"
+        let top = NSStackView(views: [NSTextField(labelWithString: "Camera:"), cameraMenu, NSView(), resolutionMenu, openButton, photoButton])
         top.orientation = .horizontal
         let header = NSStackView(views: [kindLabel, NSView(), statusLabel])
         header.orientation = .horizontal
@@ -1243,7 +1251,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
 
     @MainActor func showPhoto(_ image: CGImage, called noun: String = "photo") {
         photoOverlay?.removeFromSuperview(); photoView?.removeFromSuperview()     // a picture pasted over another
-        photoNoun = noun; photoLines = []; photoCodesRead = false
+        photoNoun = noun; photoLines = []; photoCodesRead = false; codeDismissed = false
         scanner.paused = true
         markerTimer?.invalidate()
         // The markers now outline codes on the photo: its own size, no zoom or mirroring, clicks elsewhere go to
@@ -1302,6 +1310,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
     }
 
     var photoCodesRead = false
+    var codeDismissed = false       // Esc took the picture's code out of the field: don't put it back
     /// What the field gets once the photo is read, unless a code was clicked meanwhile: the photo's text. A picture
     /// from outside the camera that holds a code gets that code, the biggest one, as when the camera sees it; its
     /// text can still be selected on it. Numbers read from printed digits wait for a click.
@@ -1309,9 +1318,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
         guard lastCode.isEmpty else { return }
         if photoNoun == "picture" {
             guard photoCodesRead else { return }
-            if let code = photoCodes.first(where: { !$0.printed }) { show(code); return }
+            if !codeDismissed, let code = photoCodes.first(where: { !$0.printed }) { show(code); return }
         }
-        guard let text = photoText else { return }
+        guard var text = photoText else { return }
+        if photoHasNoText { text = "" }
         textView.string = text
         let kind = Payload.kind(text)
         kindLabel.stringValue = text.isEmpty ? "" : kind == "Text" ? "Text in the \(photoNoun)" : "Text in the \(photoNoun) · \(kind)"
@@ -1351,16 +1361,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
         addPhotoCodes(placed)
     }
 
+    /// Reading a code's pattern as text gives a few stray characters: text counts when some of it is outside the codes.
+    var photoHasNoText: Bool {
+        let boxes = photoCodes.filter { !$0.printed }.map { $0.box.insetBy(dx: -0.02, dy: -0.02) }
+        return !boxes.isEmpty && !photoLines.contains { line in
+            let x = line.corners.map(\.x).reduce(0, +) / 4, y = line.corners.map(\.y).reduce(0, +) / 4
+            return !boxes.contains { $0.contains(CGPoint(x: x, y: y)) }
+        }
+    }
+
     /// What can be done on the photo, once it's read.
     func photoStatus() {
         guard let text = photoText, photoCodesRead || photoNoun == "photo" else { return }
         let others = photoCodes.contains { $0.text != lastCode }
-        // Reading a code's pattern as text gives a few stray characters: text counts when some of it is outside the codes.
-        let boxes = photoCodes.filter { !$0.printed }.map { $0.box.insetBy(dx: -0.02, dy: -0.02) }
-        let noText = text.isEmpty || !boxes.isEmpty && !photoLines.contains { line in
-            let x = line.corners.map(\.x).reduce(0, +) / 4, y = line.corners.map(\.y).reduce(0, +) / 4
-            return !boxes.contains { $0.contains(CGPoint(x: x, y: y)) }
-        }
+        let noText = text.isEmpty || photoHasNoText
         switch (noText, photoCodes.isEmpty, lastCode.isEmpty) {
         case (true, true, _): setStatus("No text or code found in the \(photoNoun)")
         case (false, true, _): setStatus("Select text on the \(photoNoun), or edit it below")
@@ -1370,6 +1384,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
         case (true, false, false): setStatus(others ? "Click another code to use it" : "")
         case (false, false, false): setStatus(others ? "Select text on the \(photoNoun), or click another code" : "Text on the \(photoNoun) can be selected")
         }
+    }
+
+    /// Esc on a photo or picture: with a code in the field, back to the picture's text; then back to the camera.
+    /// False when Esc isn't ours: no picture is shown, a sheet or another window has it, or text is being composed.
+    @MainActor func escape(_ event: NSEvent) -> Bool {
+        guard photoView != nil, event.window === window, window.attachedSheet == nil, !scanView.isHidden,
+              !textView.hasMarkedText() else { return false }
+        guard !lastCode.isEmpty else { closePhoto(); return true }
+        lastCode = ""; codeDismissed = true
+        preview.markers.selected = nil
+        textView.string = ""; kindLabel.stringValue = ""; setButtons([])
+        fillPhotoField()
+        photoStatus()
+        return true
     }
 
     func closePhoto() {
