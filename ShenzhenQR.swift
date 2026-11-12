@@ -7,6 +7,8 @@ import VisionKit
 import Security
 import CryptoKit
 import CoreImage.CIFilterBuiltins
+import CoreWLAN
+import CoreLocation
 
 // MARK: - What a code holds, and what can be done with it
 
@@ -1262,7 +1264,7 @@ final class SettingsWindow: NSWindowController {
 
 enum CLI {
     static var active = false
-    static let commands: Set<String> = ["scan", "camera", "cameras", "photo", "ocr", "make", "create", "parse", "run", "settings", "types", "update", "--verify-update", "help",
+    static let commands: Set<String> = ["scan", "camera", "cameras", "photo", "ocr", "make", "create", "parse", "run", "settings", "types", "update", "wifi", "--verify-update", "help",
                                         "--help", "-h", "--version", "--screenshot"]
 
     static let help = """
@@ -1284,6 +1286,10 @@ enum CLI {
                                                 --color <#RRGGBB>, --background <#RRGGBB|transparent>
                                                 --shape square|rectangle (datamatrix), --height <modules> (barcodes),
                                                 --no-digits (ean13, upca, ean8: no digits under the bars), --copy
+      shenzhenqr wifi [--current | --ssid <name> [--password <p>] [--security wpa|wep|none] [--hidden]] [make options]
+                                              A Wi-Fi code as a QR PNG in Downloads: phones that scan it join the network.
+                                              --current uses this Mac's network and password (macOS asks for Location
+                                              and your Mac's password first); --print gives its text only
       shenzhenqr parse <text>                 Say what a code's text is and what can be done with it
       shenzhenqr run <text> [<action>]        Do one of those things: a number or the start of its name
                                               (shenzhenqr run "WIFI:S:Lab;P:pw;;" join)
@@ -1796,6 +1802,53 @@ enum CLI {
         exit(0)
     }
 
+    /// wifi: a Wi-Fi code, as a QR PNG like make (or its text with --print): the network given, or this Mac's.
+    static func wifi(_ args: ArraySlice<String>) -> Never {
+        var ssid: String?, password = "", security = WiFiSecurity.wpa, hidden = false, current = false, printOnly = false
+        var rest: [String] = [], it = args.makeIterator()
+        func value(_ f: String) -> String { it.next() ?? failed("\(f) needs a value") }
+        while let a = it.next() {
+            switch a {
+            case "--current": current = true
+            case "--ssid", "--name": ssid = value(a)
+            case "--password": password = value(a)
+            case "--security":
+                switch value(a).lowercased() {
+                case "wpa", "wpa2", "wpa3": security = .wpa
+                case "wep": security = .wep
+                case "none", "open", "nopass": security = .none
+                default: fail("--security is wpa, wep or none")
+                }
+            case "--hidden": hidden = true
+            case "--print": printOnly = true
+            default: rest.append(a)      // make's options
+            }
+        }
+        if current {
+            let permission = CurrentWiFi.Permission(), done = DispatchSemaphore(value: 0)
+            var allowed = false
+            DispatchQueue.main.async { permission.request { allowed = $0; done.signal() } }
+            while done.wait(timeout: .now()) == .timedOut { RunLoop.main.run(until: Date().addingTimeInterval(0.1)) }
+            guard allowed else {
+                fail("macOS shows the Wi-Fi name only to apps allowed to use Location: allow your terminal app in System Settings › Privacy & Security › Location Services", 3)
+            }
+            guard let net = CurrentWiFi.network() else { fail("This Mac isn’t connected to a Wi-Fi network", 1) }
+            ssid = ssid ?? net.ssid; security = net.security
+            if security != .none, password.isEmpty {
+                FileHandle.standardError.write("macOS asks for your Mac’s password before sharing the Wi-Fi password…\n".data(using: .utf8)!)
+                password = CurrentWiFi.password(net.ssid) ?? failed("The Wi-Fi password wasn’t shared: give it with --password", 1)
+            }
+        }
+        guard let ssid, !ssid.isEmpty else { fail("Which network? shenzhenqr wifi --ssid <name> [--password <p>], or --current") }
+        let text = wifiPayload(ssid: ssid, password: password, security: security, hidden: hidden)
+        if printOnly { print(text); exit(0) }
+        var o = parse(ArraySlice(rest))
+        o.make.kind = .qr
+        o.rest = [text]
+        if o.out == nil { o.out = freeFileName(defaultFileBase(.qr, wifi: ssid), in: downloadsFolder).path }
+        make(o)
+    }
+
     static func types() -> Never {
         for s in VNDetectBarcodesRequest().supportedSymbologiesOrEmpty { print("\(symbologyKey(s))\t\(symbologyName(s))") }
         exit(0)
@@ -1815,6 +1868,7 @@ enum CLI {
             catch { print("refused: \(error)") }
             exit(0)
         }
+        if args[1] == "wifi" { wifi(args.dropFirst(2)) }
         if args[1] == "update" {
             // update takes its own words: update, update --check, --json
             var o = Options(); o.json = args.contains("--json"); o.rest = args.dropFirst(2).filter { $0 != "--json" }
@@ -1847,7 +1901,11 @@ enum CLI {
                 if args.count > 4 {
                     d.createView.advancedButton.state = .on; d.createView.toggleAdvanced()
                     if let k = CodeKind(rawValue: args[4]) { d.createView.kindMenu.selectItem(at: CodeKind.allCases.firstIndex(of: k)!); d.createView.kindChanged() }
-                    if args.count > 5 { d.createView.textView.string = args[5]; d.createView.changed() }
+                    if args.count > 5, args[5].hasPrefix("wifi=") {
+                        d.createView.contentMode.selectedSegment = 1; d.createView.modeChanged()
+                        d.createView.ssidField.stringValue = String(args[5].dropFirst(5)); d.createView.passwordField.stringValue = "hello-shenzhen"
+                        d.createView.changed()
+                    } else if args.count > 5 { d.createView.textView.string = args[5]; d.createView.changed() }
                 }
                 let view = d.window.contentView!
                 view.layoutSubtreeIfNeeded(); view.displayIfNeeded()
@@ -2334,6 +2392,7 @@ func makeProblem(_ error: Error, kind: CodeKind, shape: DataMatrixShape = .squar
     switch error as? EncoderError {
     case .tooLong where kind == .datamatrix && shape == .rectangle: "This is too much text for a rectangular Data Matrix: choose Square"
     case .invalidCheckDigit(let expected): "The last digit should be \(expected): it’s the check digit of the others"
+    case .invalidCharacters(let t) where t.isEmpty && kind == .qr: "Type the text to put in the code, or the Wi-Fi network’s name"
     case .invalidCharacters(let t) where t.isEmpty: "Type the text to put in the code"
     default: kind.hint
     }
@@ -2350,8 +2409,9 @@ func freeFileName(_ base: String, in folder: URL) -> URL {
     return url
 }
 
-func defaultFileBase(_ kind: CodeKind) -> String {
+func defaultFileBase(_ kind: CodeKind, wifi: String? = nil) -> String {
     let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
+    if let wifi { return "Wi-Fi \(wifi.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")) \(f.string(from: Date()))" }
     return "\(kind.title) \(f.string(from: Date()))"
 }
 
@@ -2365,8 +2425,78 @@ func parseColor(_ text: String) -> CGColor? {
     return CGColor(red: Double(rgb >> 16 & 0xFF) / 255, green: Double(rgb >> 8 & 0xFF) / 255, blue: Double(rgb & 0xFF) / 255, alpha: a)
 }
 
+// MARK: - Wi-Fi codes
+
+enum WiFiSecurity: String, CaseIterable {
+    case wpa = "WPA", wep = "WEP", none = "nopass"
+    var title: String { switch self { case .wpa: "WPA, WPA2 or WPA3"; case .wep: "WEP (old)"; case .none: "None (open network)" } }
+}
+
+/// The text phones read as "join this network": WIFI:T:WPA;S:name;P:password;; with \ ; , : " escaped.
+func wifiPayload(ssid: String, password: String, security: WiFiSecurity, hidden: Bool) -> String {
+    let esc = { (t: String) in t.reduce(into: "") { out, c in if "\\;,:\"".contains(c) { out.append("\\") }; out.append(c) } }
+    var t = "WIFI:T:\(security.rawValue);S:\(esc(ssid));"
+    if security != .none, !password.isEmpty { t += "P:\(esc(password));" }
+    if hidden { t += "H:true;" }
+    return t + ";"
+}
+
+/// The Wi-Fi network this Mac is on, and its password from the keychain. macOS gives the name only to apps allowed
+/// to use Location, and shows its own prompt before handing out the password.
+enum CurrentWiFi {
+    struct Network { let ssid: String; let security: WiFiSecurity; var password: String? }
+
+    static func security(_ s: CWSecurity) -> WiFiSecurity {
+        switch s {
+        case .none: .none
+        case .WEP, .dynamicWEP: .wep
+        default: .wpa
+        }
+    }
+
+    /// nil when there is no Wi-Fi, it isn't connected, or Location isn't allowed (macOS then hides the name).
+    static func network() -> Network? {
+        guard let i = CWWiFiClient.shared().interface(), let ssid = i.ssid(), !ssid.isEmpty else { return nil }
+        return Network(ssid: ssid, security: security(i.security()), password: nil)
+    }
+
+    /// The saved password; macOS asks the person first. nil if they decline or none is saved.
+    static func password(_ ssid: String) -> String? {
+        let p = Process(), out = Pipe()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        p.arguments = ["find-generic-password", "-D", "AirPort network password", "-a", ssid, "-w"]
+        p.standardOutput = out; p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return nil }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        let pw = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .newlines)
+        return p.terminationStatus == 0 && !pw.isEmpty ? pw : nil
+    }
+
+    /// Asks for Location when macOS hasn't asked yet; `done` gets whether it's allowed (on the main queue).
+    final class Permission: NSObject, CLLocationManagerDelegate {
+        let manager = CLLocationManager()
+        var done: ((Bool) -> Void)?
+        func request(_ done: @escaping (Bool) -> Void) {
+            switch manager.authorizationStatus {
+            case .authorizedAlways, .authorized: done(true)
+            case .notDetermined:
+                self.done = done
+                manager.delegate = self
+                manager.requestWhenInUseAuthorization()
+            default: done(false)
+            }
+        }
+        func locationManagerDidChangeAuthorization(_ m: CLLocationManager) {
+            guard m.authorizationStatus != .notDetermined, let done else { return }
+            self.done = nil
+            DispatchQueue.main.async { done(m.authorizationStatus == .authorizedAlways || m.authorizationStatus == .authorized) }
+        }
+    }
+}
+
 /// The Create tab: type, text, size and where to save, with the rest under Advanced.
-final class CreateView: NSView, NSTextViewDelegate {
+final class CreateView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
     let kindMenu = NSPopUpButton()
     let textView = NSTextView()
     let preview = NSImageView()
@@ -2379,10 +2509,17 @@ final class CreateView: NSView, NSTextViewDelegate {
     let transparentBox = NSButton(checkboxWithTitle: "Transparent background", target: nil, action: nil)
     let nameField = NSTextField(string: "")
     let infoLabel = NSTextField(labelWithString: ""), statusLabel = NSTextField(labelWithString: "")
+    let contentMode = NSSegmentedControl(labels: ["Text", "Wi-Fi network"], trackingMode: .selectOne, target: nil, action: nil)
+    let ssidField = NSTextField(string: ""), passwordField = NSTextField(string: "")
+    let securityMenu = NSPopUpButton(), hiddenBox = NSButton(checkboxWithTitle: "Hidden network", target: nil, action: nil)
+    let currentButton = NSButton(title: "Use Current Wi-Fi", target: nil, action: nil)
+    let permission = CurrentWiFi.Permission()
     let saveButton = NSButton(title: "Save PNG", target: nil, action: nil)
     let copyButton = NSButton(title: "Copy Image", target: nil, action: nil)
     let revealButton = NSButton(title: "Show in Finder", target: nil, action: nil)
     var rows: [String: NSGridRow] = [:]
+    var textRow: NSGridRow?, wifiRows: [NSGridRow] = []
+    var wifiMode: Bool { kind == .qr && contentMode.selectedSegment == 1 }
     var lastSaved: URL?
     var current: CGImage?
 
@@ -2426,13 +2563,28 @@ final class CreateView: NSView, NSTextViewDelegate {
         nameField.widthAnchor.constraint(equalToConstant: 260).isActive = true
         // One grid, so the labels line up: the basic rows, Advanced, then its rows (shown when open and when they
         // apply to the type).
+        contentMode.selectedSegment = 0
+        contentMode.target = self; contentMode.action = #selector(modeChanged)
+        ssidField.placeholderString = "Network name"; passwordField.placeholderString = "Password"
+        for f in [ssidField, passwordField] { f.delegate = self; f.widthAnchor.constraint(equalToConstant: 220).isActive = true }
+        securityMenu.addItems(withTitles: WiFiSecurity.allCases.map(\.title))
+        securityMenu.target = self; securityMenu.action = #selector(changed)
+        hiddenBox.target = self; hiddenBox.action = #selector(changed)
+        currentButton.target = self; currentButton.action = #selector(useCurrentWiFi)
         let basic = NSGridView(views: [
             [NSTextField(labelWithString: "Type:"), kindMenu],
-            [NSTextField(labelWithString: "Content:"), scroll],
+            [NSTextField(labelWithString: "Content:"), contentMode],
+            [NSGridCell.emptyContentView, scroll],
+            [NSTextField(labelWithString: "Network:"), NSStackView(views: [ssidField, currentButton])],
+            [NSTextField(labelWithString: "Password:"), passwordField],
+            [NSTextField(labelWithString: "Security:"), securityMenu],
+            [NSGridCell.emptyContentView, hiddenBox],
             [NSTextField(labelWithString: "Width:"), NSStackView(views: [sizeField, NSTextField(labelWithString: "pixels"), infoLabel])],
             [NSTextField(labelWithString: "Save in:"), folderControl],
             [NSGridCell.emptyContentView, NSStackView(views: [advancedButton, advancedLabel])],
         ])
+        textRow = basic.row(at: 2)
+        wifiRows = (3...6).map { basic.row(at: $0) }
         let addRow = { (key: String, label: String, views: [NSView]) in
             let content = views.count == 1 ? views[0] : NSStackView(views: views)
             self.rows[key] = basic.addRow(with: [label.isEmpty ? NSGridCell.emptyContentView : NSTextField(labelWithString: label), content])
@@ -2447,7 +2599,7 @@ final class CreateView: NSView, NSTextViewDelegate {
         basic.column(at: 0).xPlacement = .trailing
         basic.column(at: 0).width = 118
         basic.rowSpacing = 8
-        basic.row(at: 1).yPlacement = .top
+        basic.row(at: 2).yPlacement = .top
         infoLabel.textColor = .secondaryLabelColor
         scroll.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
 
@@ -2496,17 +2648,70 @@ final class CreateView: NSView, NSTextViewDelegate {
 
     /// Advanced rows: shown when Advanced is open, each only for the types it applies to.
     func showRows() {
+        // Wi-Fi codes are QR codes: phones read the network from those.
+        basicRow(contentMode)?.isHidden = kind != .qr
+        textRow?.isHidden = wifiMode
+        for r in wifiRows { r.isHidden = !wifiMode }
         let open = advancedButton.state == .on, k = kind
         let applies: [String: Bool] = ["correction": !k.corrections.isEmpty, "shape": k == .datamatrix, "height": k.linear, "label": k.retail]
         for (key, row) in rows { row.isHidden = !open || applies[key] == false }
     }
 
     func textDidChange(_ notification: Notification) { changed() }
+    func controlTextDidChange(_ obj: Notification) { changed() }
+
+    func basicRow(_ view: NSView) -> NSGridRow? {
+        guard let grid = view.superview as? NSGridView ?? view.superview?.superview as? NSGridView else { return nil }
+        return grid.cell(for: view)?.row
+    }
+
+    @objc func modeChanged() { showRows(); changed() }
+
+    /// Fills in the network this Mac is on and its password. macOS asks for Location first (it counts Wi-Fi names
+    /// as location), then for the Mac's password before showing the Wi-Fi password.
+    @objc func useCurrentWiFi() {
+        permission.request { allowed in
+            guard allowed else {
+                let a = NSAlert()
+                a.messageText = "ShenzhenQR can’t see the Wi-Fi name"
+                a.informativeText = "macOS shows the name of your Wi-Fi network only to apps allowed to use Location. Allow ShenzhenQR in Location Services, then try again."
+                a.addButton(withTitle: "Open Location Services"); a.addButton(withTitle: "Cancel")
+                if a.runModal() == .alertFirstButtonReturn {
+                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_LocationServices")!)
+                }
+                return
+            }
+            guard let net = CurrentWiFi.network() else { self.say("This Mac isn’t connected to a Wi-Fi network", error: true); return }
+            self.ssidField.stringValue = net.ssid
+            self.securityMenu.selectItem(at: WiFiSecurity.allCases.firstIndex(of: net.security) ?? 0)
+            self.hiddenBox.state = .off
+            self.changed()
+            guard net.security != .none else { return }
+            self.say("macOS asks for your Mac’s password before sharing the Wi-Fi password…", error: false)
+            DispatchQueue.global(qos: .userInitiated).async {
+                let pw = CurrentWiFi.password(net.ssid)
+                DispatchQueue.main.async {
+                    if let pw { self.passwordField.stringValue = pw; self.changed() }
+                    else { self.say("The password wasn’t shared: type it in", error: true) }
+                }
+            }
+        }
+    }
+
+    func say(_ text: String, error: Bool) {
+        statusLabel.stringValue = text
+        statusLabel.textColor = error ? .systemRed : .secondaryLabelColor
+        revealButton.isHidden = true
+    }
 
     var options: MakeOptions {
         var o = MakeOptions()
         o.kind = kind
-        o.text = textView.string
+        o.text = wifiMode
+            ? (ssidField.stringValue.isEmpty ? "" : wifiPayload(ssid: ssidField.stringValue, password: passwordField.stringValue,
+                                                                security: WiFiSecurity.allCases[max(0, securityMenu.indexOfSelectedItem)],
+                                                                hidden: hiddenBox.state == .on))
+            : textView.string
         o.size = max(16, min(20000, sizeField.integerValue > 0 ? sizeField.integerValue : 1024))
         o.margin = marginMenu.indexOfSelectedItem > 0 ? marginMenu.indexOfSelectedItem - 1 : nil
         if !kind.corrections.isEmpty { o.correction = kind.corrections[max(0, correctionMenu.indexOfSelectedItem)].key }
@@ -2519,6 +2724,8 @@ final class CreateView: NSView, NSTextViewDelegate {
     }
 
     @objc func changed() {
+        nameField.placeholderString = wifiMode ? "Wi-Fi \(ssidField.stringValue.isEmpty ? "<network>" : ssidField.stringValue) <date and time>"
+                                               : "\(kind.title) <date and time>"
         do {
             let (image, _) = try renderCode(options)
             current = image
@@ -2542,7 +2749,8 @@ final class CreateView: NSView, NSTextViewDelegate {
         guard let image = current else { return }
         let folder = folderControl.url ?? downloadsFolder
         let name = nameField.stringValue.trimmingCharacters(in: .whitespaces)
-        let url = freeFileName(name.isEmpty ? defaultFileBase(kind) : (name.hasSuffix(".png") ? String(name.dropLast(4)) : name), in: folder)
+        let base = defaultFileBase(kind, wifi: wifiMode ? ssidField.stringValue : nil)
+        let url = freeFileName(name.isEmpty ? base : (name.hasSuffix(".png") ? String(name.dropLast(4)) : name), in: folder)
         do {
             try pngData(image).write(to: url)
             lastSaved = url

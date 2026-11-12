@@ -17,7 +17,7 @@ Apple Silicon · macOS 14+ · Signed and notarized
 - **Settings** (⌘,): the camera resolution, and how many processor cores read frames at the same time (4 unless you change it).
 - **The text, ready to use.** What the code holds appears in a field you can select and edit. **Copy** puts it on the clipboard.
 - **The right next step.** Depending on the code: **Join** a Wi-Fi network (or copy its password), **Open in Browser**, **Add to Contacts**, **Add to Calendar**, **Write Email**, **Call**, **Send Message** or **Show in Maps**. Buttons follow your edits.
-- **Make codes.** The **Create** tab at the top makes a QR code, Data Matrix, Aztec code, PDF417, Code 128, EAN-13, UPC-A or EAN-8 as a crisp PNG, saved in Downloads unless you choose another folder. Type and content are all it needs; **Advanced** has error correction, quiet zone, Data Matrix shape, bar height, the digits under EAN and UPC barcodes, colors, a transparent background and the file name, each with the standard value until you change it.
+- **Make codes.** The **Create** tab at the top makes a QR code, Data Matrix, Aztec code, PDF417, Code 128, EAN-13, UPC-A or EAN-8 as a crisp PNG, saved in Downloads unless you choose another folder. Type and content are all it needs; **Advanced** has error correction, quiet zone, Data Matrix shape, bar height, the digits under EAN and UPC barcodes, colors, a transparent background and the file name, each with the standard value until you change it. For a QR code, **Wi-Fi network** makes a code that phones scan to join a network: type its name and password, or **Use Current Wi-Fi** to take this Mac's (macOS asks for Location, as it counts Wi-Fi names as location, then for your Mac's password before sharing the Wi-Fi password).
 - **Updates.** ShenzhenQR checks for a new version once a day and asks before installing it; **Check for Updates…** in the app menu checks now.
 
 ## Install
@@ -51,6 +51,8 @@ desk.jpg: QR code · Wi-Fi network · at x 513, y 167, 301 × 283 px of 1280 × 
   `pdf417`, `code128`, `ean13`, `upca` or `ean8`; `--out` another file or folder (`-` writes the PNG to standard
   output); `--size`, `--margin`, `--correction`, `--color`, `--background` (`transparent` too), `--shape`, `--height`,
   `--no-digits`. It prints where it saved the file.
+- `shenzhenqr wifi --ssid <name> --password <p>` makes a Wi-Fi code (`--current` takes this Mac's network; `--print`
+  gives its text only; `--security wpa|wep|none`, `--hidden`, and make's options).
 - `shenzhenqr update` installs the newest version; `shenzhenqr update --check` only says whether there is one.
 - `shenzhenqr settings [<name> <value>]` shows or changes the app's settings: `resolution` (`auto` or a size such as
   `1920x1080`), `cores`, `zoom`, `camera`.
