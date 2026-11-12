@@ -9,6 +9,7 @@ import CryptoKit
 import CoreImage.CIFilterBuiltins
 import CoreWLAN
 import CoreLocation
+import UniformTypeIdentifiers
 
 // MARK: - What a code holds, and what can be done with it
 
@@ -718,6 +719,158 @@ enum Installer {
     }
 }
 
+// MARK: - Pictures from outside the camera: pasted, dropped on the window, or opened
+
+enum Picture {
+    static func isPicture(_ type: NSPasteboard.PasteboardType) -> Bool { UTType(type.rawValue)?.conforms(to: .image) ?? false }
+    static func isPicture(_ url: URL) -> Bool {
+        ((try? url.resourceValues(forKeys: [.contentTypeKey]))?.contentType ?? UTType(filenameExtension: url.pathExtension))?
+            .conforms(to: .image) ?? false
+    }
+    static func files(_ board: NSPasteboard) -> [URL] {
+        (board.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
+    }
+    /// Pictures a drag promises to write: a screenshot's thumbnail, a picture dragged out of a browser or of Photos.
+    static func promises(_ board: NSPasteboard) -> [NSFilePromiseReceiver] {
+        ((board.readObjects(forClasses: [NSFilePromiseReceiver.self]) as? [NSFilePromiseReceiver]) ?? []).filter {
+            $0.fileTypes.contains { (UTType($0) ?? UTType(filenameExtension: $0))?.conforms(to: .image) ?? false }
+        }
+    }
+
+    /// A picture file, turned the way its orientation says.
+    static func load(_ url: URL) -> CGImage? {
+        CIImage(contentsOf: url, options: [.applyOrientationProperty: true]).flatMap { cgImage($0, region: nil) }
+    }
+    static func load(_ data: Data) -> CGImage? {
+        CIImage(data: data, options: [.applyOrientationProperty: true]).flatMap { cgImage($0, region: nil) }
+    }
+
+    /// Whether the clipboard or a drag holds a picture: a picture file, or a picture itself. Looks at types only.
+    /// A copied file also carries its icon, which isn't what was copied: with files, only they count.
+    static func holdsPicture(_ board: NSPasteboard) -> Bool {
+        let files = files(board)
+        return files.isEmpty ? (board.types ?? []).contains(where: isPicture) : files.contains(where: isPicture)
+    }
+
+    static func read(_ board: NSPasteboard) -> CGImage? {
+        let files = files(board)
+        if !files.isEmpty { return files.lazy.compactMap(load).first }
+        return (board.types ?? []).lazy.filter(isPicture).compactMap { board.data(forType: $0).flatMap(load) }.first
+    }
+
+    /// Whether ⌘V reads the clipboard's picture rather than pasting its text. With the cursor in a text field, what was
+    /// copied decides: text from a spreadsheet or a word processor comes with a picture of itself after the text, a
+    /// picture from a browser comes with its address after the picture.
+    static func pastesAsPicture(_ board: NSPasteboard, intoText: Bool) -> Bool {
+        guard holdsPicture(board) else { return false }
+        let types = board.types ?? []
+        guard intoText, files(board).isEmpty, let text = types.firstIndex(of: .string),
+              let picture = types.firstIndex(where: isPicture) else { return true }
+        return picture < text
+    }
+}
+
+/// Shown around the window while a picture is dragged over it.
+final class DropRing: NSView {
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {
+        layer?.borderColor = NSColor.controlAccentColor.cgColor
+        layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.1).cgColor
+        layer?.borderWidth = 3; layer?.cornerRadius = 8
+    }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
+/// The window's content: a picture dragged onto it, anywhere, is read. From Finder (a file), from a browser or another
+/// app (the picture itself), or a screenshot's thumbnail (a file it promises to write).
+final class DropView: NSView {
+    /// The picture that was dropped (nil when it couldn't be opened as one), and its file's name when it was a file.
+    var onPicture: ((CGImage?, String?) -> Void)?
+    let ring = DropRing()
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        ring.wantsLayer = true; ring.isHidden = true
+        registerForDraggedTypes([.fileURL] + NSImage.imageTypes.map { NSPasteboard.PasteboardType($0) }
+                                + NSFilePromiseReceiver.readableDraggedTypes.map { NSPasteboard.PasteboardType($0) })
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    static func holdsPicture(_ sender: NSDraggingInfo) -> Bool {
+        Picture.holdsPicture(sender.draggingPasteboard) || !Picture.promises(sender.draggingPasteboard).isEmpty
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        let picture = Self.holdsPicture(sender)
+        ring.isHidden = !picture
+        return picture ? .copy : []
+    }
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation { ring.isHidden ? [] : .copy }
+    override func draggingExited(_ sender: NSDraggingInfo?) { ring.isHidden = true }
+    override func draggingEnded(_ sender: NSDraggingInfo) { ring.isHidden = true }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        ring.isHidden = true
+        let board = sender.draggingPasteboard
+        if Picture.holdsPicture(board) {
+            let image = Picture.read(board)             // read now: the drag's contents go away with it
+            let name = Picture.files(board).first?.lastPathComponent
+            DispatchQueue.main.async { self.onPicture?(image, name) }
+            return true
+        }
+        guard let promise = Picture.promises(board).first else { return false }
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("ShenzhenQR-" + UUID().uuidString)
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        var first = true
+        promise.receivePromisedFiles(atDestination: folder, options: [:], operationQueue: .main) { url, error in
+            guard first else { return }
+            first = false
+            self.onPicture?(error == nil ? Picture.load(url) : nil, url.lastPathComponent)
+            try? FileManager.default.removeItem(at: folder)
+        }
+        return true
+    }
+}
+
+extension NSView {
+    /// Picture views take drags for themselves, and refuse them when they can't be changed: a picture dropped on the
+    /// photo or on the Create preview would go nowhere. Without that, the drop reaches the window's content.
+    func leaveDropsToWindow() {
+        if self is NSImageView { unregisterDraggedTypes() }
+        subviews.forEach { $0.leaveDropsToWindow() }
+    }
+}
+
+/// A text field of the window. A picture dragged onto it is read like one dropped anywhere else on the window, in
+/// place of its file name being typed in; text dragged onto it goes in as usual.
+final class FieldTextView: NSTextView {
+    private var pictureDrag = false
+    private var drop: DropView? { window?.contentView as? DropView }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        pictureDrag = drop != nil && DropView.holdsPicture(sender)
+        return pictureDrag ? drop!.draggingEntered(sender) : super.draggingEntered(sender)
+    }
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        pictureDrag ? .copy : super.draggingUpdated(sender)
+    }
+    override func draggingExited(_ sender: NSDraggingInfo?) {
+        if pictureDrag { pictureDrag = false; drop?.draggingExited(sender) } else { super.draggingExited(sender) }
+    }
+    override func draggingEnded(_ sender: NSDraggingInfo) {
+        if pictureDrag { pictureDrag = false; drop?.draggingEnded(sender) } else { super.draggingEnded(sender) }
+    }
+    override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        pictureDrag ? true : super.prepareForDragOperation(sender)
+    }
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        pictureDrag ? drop?.performDragOperation(sender) ?? false : super.performDragOperation(sender)
+    }
+    override func concludeDragOperation(_ sender: NSDraggingInfo?) {
+        if pictureDrag { pictureDrag = false } else { super.concludeDragOperation(sender) }
+    }
+}
+
 // MARK: - Window
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NSToolbarDelegate {
@@ -729,7 +882,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
     var frameSize: CGSize?
     let kindLabel = NSTextField(labelWithString: "")
     let statusLabel = NSTextField(labelWithString: "")
-    let textView = NSTextView()
+    let textView = FieldTextView()
     let buttons = NSStackView()
     var preview: PreviewView!
     var lastCode = "", lastCodeAt = Date.distantPast
@@ -747,13 +900,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
         buildWindow()
         Updater.shared.start()
         scanner.onCodes = { [weak self] codes, size in self?.found(codes, size: size) }
-        scanner.onSize = { [weak self] size in self?.frameSize = size; self?.refreshResolutionMenu(); self?.fitToPicture(size) }
+        scanner.onSize = { [weak self] size in
+            self?.frameSize = size; self?.refreshResolutionMenu()
+            if self?.photoView == nil { self?.fitToPicture(size) }
+        }
         scanner.region = { _ in zoomRegion(Settings.zoom) }
         preview.markers.onPick = { [weak self] d in self?.show(d) }
         preview.markers.onDoubleClick = { [weak self] in self?.setZoom(Settings.zoom > 1.05 ? 1 : 2.5) }
         preview.onZoom = { [weak self] z in self?.setZoom(z) }
         preview.zoom = Settings.zoom
         NSApp.activate(ignoringOtherApps: true)
+        // Opened on a picture (Open With in Finder, or a picture dropped on the icon): it shows from the start, and the
+        // camera stays off until Back to Camera.
+        if let urls = openAtLaunch { openAtLaunch = nil; MainActor.assumeIsolated { openPictures(urls) } }
+        if photoView == nil { askForCamera() }
+        else if AVCaptureDevice.authorizationStatus(for: .video) == .authorized { reloadCameras() }   // the menu only
+        for name in [AVCaptureDevice.wasConnectedNotification, AVCaptureDevice.wasDisconnectedNotification] {
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.reloadCameras() }
+        }
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { true }
+
+    var cameraAsked = false
+    /// Starts the camera, asking for access the first time. Not done while the app shows a picture it was opened on.
+    func askForCamera() {
+        cameraAsked = true
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized: reloadCameras()
         case .notDetermined:
@@ -762,12 +934,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
             }
         default: noCameraAccess()
         }
-        for name in [AVCaptureDevice.wasConnectedNotification, AVCaptureDevice.wasDisconnectedNotification] {
-            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.reloadCameras() }
+    }
+
+    // MARK: Pictures from outside the camera
+
+    var openAtLaunch: [URL]?
+    /// Pictures opened from Finder (Open With, or dropped on the app's icon). At launch this comes before the window.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard window != nil else { openAtLaunch = urls; return }
+        MainActor.assumeIsolated { openPictures(urls) }
+    }
+
+    /// The first of them that is a picture.
+    @MainActor func openPictures(_ urls: [URL]) {
+        guard let first = urls.first else { return }
+        showPicture(urls.lazy.compactMap(Picture.load).first, name: first.lastPathComponent)
+    }
+
+    /// File › Open Picture…
+    @MainActor @objc func openPicture() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.image]
+        panel.prompt = "Open"
+        window.makeKeyAndOrderFront(nil)
+        panel.beginSheetModal(for: window) { answer in
+            guard answer == .OK, let url = panel.url else { return }
+            MainActor.assumeIsolated { self.openPictures([url]) }
         }
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { true }
+    /// ⌘V: a picture on the clipboard is read; anything else is pasted where the cursor is, as usual.
+    @MainActor @objc func pasteAnything(_ sender: Any?) {
+        let board = NSPasteboard.general
+        let intoText = (NSApp.keyWindow?.firstResponder as? NSTextView)?.isEditable == true
+        guard Picture.pastesAsPicture(board, intoText: intoText) else {
+            NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: sender)
+            return
+        }
+        showPicture(Picture.read(board), name: Picture.files(board).first?.lastPathComponent)
+    }
+
+    /// A picture that was pasted, dropped on the window or opened is read as a photo is: its codes are outlined and
+    /// its text can be selected. From the Create tab too, which then gives way to Scan. nil: it couldn't be opened.
+    @MainActor func showPicture(_ image: CGImage?, name: String? = nil) {
+        guard let image else {
+            let problem = name.map { "“\($0)” can’t be opened as a picture" } ?? "That picture can’t be opened"
+            if scanView.isHidden { createView.say(problem, error: true) } else { setStatus(problem) }
+            return
+        }
+        showPhoto(image, called: "picture")
+        if scanView.isHidden { showTab(0) }          // the camera stays off: a picture is shown
+        fitToPicture(CGSize(width: image.width, height: image.height))
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
 
     func buildWindow() {
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 640),
@@ -785,7 +1005,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
         kindLabel.textColor = .secondaryLabelColor
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.lineBreakMode = .byTruncatingTail
-        statusLabel.stringValue = "Point the camera at a code"
+        statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)   // shortened, rather than widening the window
+        statusLabel.stringValue = "Point the camera at a code, or paste or drop a picture"
 
         textView.isEditable = true; textView.isSelectable = true; textView.isRichText = false
         textView.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
@@ -821,7 +1042,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
         scroll.heightAnchor.constraint(equalToConstant: 110).isActive = true
         preview.setContentHuggingPriority(.defaultLow, for: .vertical)
         // Two tabs in the top bar: Scan (the camera) and Create (making codes).
-        let container = NSView()
+        let container = DropView()
+        container.onPicture = { [weak self] image, name in MainActor.assumeIsolated { self?.showPicture(image, name: name) } }
         createView = CreateView()
         for v in [stack, createView!] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
@@ -832,7 +1054,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
             ])
         }
         scanView = stack
+        container.ring.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(container.ring)            // over everything else
+        NSLayoutConstraint.activate([
+            container.ring.topAnchor.constraint(equalTo: container.topAnchor, constant: 4),
+            container.ring.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -4),
+            container.ring.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 4),
+            container.ring.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -4),
+        ])
         window.contentView = container
+        container.leaveDropsToWindow()
         let toolbar = NSToolbar(identifier: "main")
         toolbar.delegate = self
         toolbar.centeredItemIdentifiers = [Self.tabsItem]
@@ -864,12 +1095,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
 
     @objc func tabChosen() { showTab(tabs.selectedSegment) }
 
-    /// The window's height set so the camera picture fills the preview, without black bars; the width and the top
-    /// edge stay where they are.
+    /// The window's height set so the picture (the camera's, or one that was pasted, dropped or opened) fills the
+    /// preview, without black bars; the width and the top edge stay where they are. A very wide picture keeps the
+    /// preview's least height, a very tall one stops at the screen's.
     func fitToPicture(_ size: CGSize, screenshot: Bool = false) {
         guard !offscreen || screenshot, size.width > 0, !scanView.isHidden, let window, !window.inLiveResize else { return }
         window.contentView?.layoutSubtreeIfNeeded()
-        let want = (preview.frame.width * size.height / size.width).rounded()
+        let want = max(220, (preview.frame.width * size.height / size.width).rounded())
         let delta = want - preview.frame.height
         guard abs(delta) > 1 else { return }
         var frame = window.frame
@@ -938,7 +1170,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
         cameraMenu.selectItem(at: index)
         frameSize = nil
         refreshResolutionMenu()
-        if !scanView.isHidden { startCamera() }
+        // Not behind a picture the camera wasn't running for.
+        if !scanView.isHidden, photoView == nil || scanner.session.isRunning { startCamera() }
     }
 
     func startCamera() {
@@ -1006,8 +1239,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
     }
 
     var photoCodes: [Detection] = [], photoText: String?, photoLines: [TextLine] = []
+    var photoNoun = "photo"         // "picture" for one that didn't come from the camera
 
-    @MainActor func showPhoto(_ image: CGImage) {
+    @MainActor func showPhoto(_ image: CGImage, called noun: String = "photo") {
+        photoOverlay?.removeFromSuperview(); photoView?.removeFromSuperview()     // a picture pasted over another
+        photoNoun = noun; photoLines = []; photoCodesRead = false
         scanner.paused = true
         markerTimer?.invalidate()
         // The markers now outline codes on the photo: its own size, no zoom or mirroring, clicks elsewhere go to
@@ -1030,13 +1266,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
         overlay.frame = view.bounds
         overlay.autoresizingMask = [.width, .height]
         view.addSubview(overlay)
+        view.leaveDropsToWindow()
         photoView = view; photoOverlay = overlay
         photoCodes = []; photoText = nil
         photoButton.title = "Back to Camera"
         photoButton.image = NSImage(systemSymbolName: "video", accessibilityDescription: nil)
         lastCode = ""
         textView.string = ""; kindLabel.stringValue = ""; setButtons([])
-        setStatus("Reading the photo…")
+        setStatus("Reading the \(noun)…")
         DispatchQueue.global(qos: .userInitiated).async {
             let codes = detectInPhoto(image)
             let lines = recognizeText(VNImageRequestHandler(cgImage: image, options: [:]))
@@ -1045,6 +1282,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
                 self.photoLines = lines
                 self.addPhotoCodes(codes)
                 self.addTranscriptCodes()
+                self.photoCodesRead = true
+                self.fillPhotoField()
                 self.photoStatus()
             }
         }
@@ -1053,18 +1292,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
             let analysis = try? await ImageAnalyzer().analyze(image, orientation: .up, configuration: config)
             guard self.photoOverlay === overlay else { return }
             overlay.analysis = analysis
+            view.leaveDropsToWindow()               // Live Text adds its own buttons
             let text = analysis?.transcript ?? ""
             self.photoText = text
             self.addTranscriptCodes()
-            // The field gets the photo's text, unless a code was clicked meanwhile.
-            if self.lastCode.isEmpty {
-                self.textView.string = text
-                let kind = Payload.kind(text)
-                self.kindLabel.stringValue = text.isEmpty ? "" : kind == "Text" ? "Text in the photo" : "Text in the photo · \(kind)"
-                self.refreshActions()
-            }
+            self.fillPhotoField()
             self.photoStatus()
         }
+    }
+
+    var photoCodesRead = false
+    /// What the field gets once the photo is read, unless a code was clicked meanwhile: the photo's text. A picture
+    /// from outside the camera that holds a code gets that code, the biggest one, as when the camera sees it; its
+    /// text can still be selected on it. Numbers read from printed digits wait for a click.
+    func fillPhotoField() {
+        guard lastCode.isEmpty else { return }
+        if photoNoun == "picture" {
+            guard photoCodesRead else { return }
+            if let code = photoCodes.first(where: { !$0.printed }) { show(code); return }
+        }
+        guard let text = photoText else { return }
+        textView.string = text
+        let kind = Payload.kind(text)
+        kindLabel.stringValue = text.isEmpty ? "" : kind == "Text" ? "Text in the \(photoNoun)" : "Text in the \(photoNoun) · \(kind)"
+        refreshActions()
     }
 
     func addPhotoCodes(_ codes: [Detection]) {
@@ -1102,12 +1353,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
 
     /// What can be done on the photo, once it's read.
     func photoStatus() {
-        guard let text = photoText else { return }
-        switch (text.isEmpty, photoCodes.isEmpty) {
-        case (true, true): setStatus("No text or code found in the photo")
-        case (false, true): setStatus("Select text on the photo, or edit it below")
-        case (true, false): setStatus("Click the outlined code to use it")
-        case (false, false): setStatus("Select text on the photo, or click a code to use it")
+        guard let text = photoText, photoCodesRead || photoNoun == "photo" else { return }
+        let others = photoCodes.contains { $0.text != lastCode }
+        // Reading a code's pattern as text gives a few stray characters: text counts when some of it is outside the codes.
+        let boxes = photoCodes.filter { !$0.printed }.map { $0.box.insetBy(dx: -0.02, dy: -0.02) }
+        let noText = text.isEmpty || !boxes.isEmpty && !photoLines.contains { line in
+            let x = line.corners.map(\.x).reduce(0, +) / 4, y = line.corners.map(\.y).reduce(0, +) / 4
+            return !boxes.contains { $0.contains(CGPoint(x: x, y: y)) }
+        }
+        switch (noText, photoCodes.isEmpty, lastCode.isEmpty) {
+        case (true, true, _): setStatus("No text or code found in the \(photoNoun)")
+        case (false, true, _): setStatus("Select text on the \(photoNoun), or edit it below")
+        case (true, false, true): setStatus("Click the outlined code to use it")
+        case (false, false, true): setStatus("Select text on the \(photoNoun), or click a code to use it")
+        // A code is in the field already.
+        case (true, false, false): setStatus(others ? "Click another code to use it" : "")
+        case (false, false, false): setStatus(others ? "Select text on the \(photoNoun), or click another code" : "Text on the \(photoNoun) can be selected")
         }
     }
 
@@ -1125,6 +1386,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
         lastCode = ""; lastCodeAt = .distantPast
         setStatus("")
         scanner.paused = false
+        // The camera is off when the picture came while it was (the app opened on it, or it was pasted in Create).
+        if !cameraAsked { askForCamera() } else if !scanner.session.isRunning { startCamera() }
+        if let frameSize { fitToPicture(frameSize) }
     }
 
     func setZoom(_ z: Double) {
@@ -1206,6 +1470,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
     }
 
     func setStatus(_ s: String) { statusLabel.stringValue = s }
+}
+
+extension AppDelegate: NSMenuItemValidation {
+    /// Paste: when the clipboard holds a picture, or there is a text field to paste into.
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        guard item.action == #selector(pasteAnything(_:)) else { return true }
+        return Picture.holdsPicture(.general) || NSApp.target(forAction: #selector(NSText.paste(_:)), to: nil, from: item) != nil
+    }
 }
 
 final class SettingsWindow: NSWindowController {
@@ -2501,7 +2773,7 @@ enum CurrentWiFi {
 /// The Create tab: type, text, size and where to save, with the rest under Advanced.
 final class CreateView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
     let kindMenu = NSPopUpButton()
-    let textView = NSTextView()
+    let textView = FieldTextView()
     let preview = NSImageView()
     let sizeField = NSTextField(string: "1024")
     let folderControl = NSPathControl()
@@ -3226,8 +3498,8 @@ let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
 app.setActivationPolicy(.regular)
-let menu = NSMenu(), appItem = NSMenuItem(), editItem = NSMenuItem()
-menu.addItem(appItem); menu.addItem(editItem)
+let menu = NSMenu(), appItem = NSMenuItem(), fileItem = NSMenuItem(), editItem = NSMenuItem()
+menu.addItem(appItem); menu.addItem(fileItem); menu.addItem(editItem)
 let appMenu = NSMenu()
 appMenu.addItem(withTitle: "Check for Updates…", action: #selector(Updater.checkNow), keyEquivalent: "").target = Updater.shared
 let autoItem = appMenu.addItem(withTitle: "Automatically Check for Updates", action: #selector(Updater.toggleAutomatic(_:)), keyEquivalent: "")
@@ -3243,6 +3515,12 @@ for (t, s, k) in [("Undo", "undo:", "z"), ("Redo", "redo:", "Z"), ("Cut", "cut:"
                   ("Paste", "paste:", "v"), ("Select All", "selectAll:", "a")] {
     editMenu.addItem(withTitle: t, action: Selector(s), keyEquivalent: k)
 }
+// Paste reads a picture when the clipboard holds one, wherever the cursor is.
+let pasteItem = editMenu.item(withTitle: "Paste")!
+pasteItem.action = #selector(AppDelegate.pasteAnything(_:)); pasteItem.target = delegate
 editItem.submenu = editMenu
+let fileMenu = NSMenu(title: "File")
+fileMenu.addItem(withTitle: "Open Picture…", action: #selector(AppDelegate.openPicture), keyEquivalent: "o").target = delegate
+fileItem.submenu = fileMenu
 app.mainMenu = menu
 app.run()

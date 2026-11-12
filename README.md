@@ -1,6 +1,6 @@
 # ShenzhenQR
 
-A tiny Mac app that reads QR codes and barcodes from any camera (the built-in one, a USB webcam, a virtual camera or an iPhone) and makes them.
+A tiny Mac app that reads QR codes and barcodes from any camera (the built-in one, a USB webcam, a virtual camera or an iPhone) or from a picture, and makes them.
 
 <a href="https://github.com/casimir-engineering/shenzhen-qr/releases/latest/download/ShenzhenQR.dmg"><img src="https://img.shields.io/badge/Download%20for%20macOS-Apple%20Silicon-2ea44f?style=for-the-badge&logo=apple&logoColor=white" alt="Download for macOS (Apple Silicon)" height="46"></a>
 
@@ -16,6 +16,7 @@ Apple Silicon · macOS 14+ · Signed and notarized
 - **The right next step.** Depending on the code: **Join** a Wi-Fi network (or copy its password), **Open in Browser**, **Add to Contacts**, **Add to Calendar**, **Write Email**, **Call**, **Send Message** or **Show in Maps**. Buttons follow your edits.
 - **Zoom for small codes.** Double-click the picture to zoom 2.5× into the middle, and again to zoom out, or use the zoom bar at the bottom of the picture. Only the middle is read then, closer up, so smaller codes are found.
 - **Photo and text.** **Photo** freezes the picture and reads the text in it, Chinese included: select text right on the photo, as in Preview, or edit all of it in the field below. Codes on the photo are outlined too; click one to put it in the field.
+- **Pictures too.** Paste a picture (⌘V), drop one anywhere on the window, or open one with **File › Open Picture…** (⌘O) or **Open With** in Finder: a screenshot, a photo, a picture copied in a browser. Its code goes in the field and its text can be selected, as on a photo. This works from the Create tab as well. **Back to Camera** returns; opened on a picture, ShenzhenQR leaves the camera off until then.
 - **Blurred barcodes.** On a photo or a picture, when a barcode's bars are too blurred to read, its number is read from the digits printed under it, and kept only if its check digit is right (dashed outline). A camera can't focus up close: hold the code farther away and zoom in instead.
 
 ## Create
