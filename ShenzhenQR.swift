@@ -866,8 +866,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
 
     /// The window's height set so the camera picture fills the preview, without black bars; the width and the top
     /// edge stay where they are.
-    func fitToPicture(_ size: CGSize) {
-        guard !offscreen, size.width > 0, !scanView.isHidden, let window, !window.inLiveResize else { return }
+    func fitToPicture(_ size: CGSize, screenshot: Bool = false) {
+        guard !offscreen || screenshot, size.width > 0, !scanView.isHidden, let window, !window.inLiveResize else { return }
         window.contentView?.layoutSubtreeIfNeeded()
         let want = (preview.frame.width * size.height / size.width).rounded()
         let delta = want - preview.frame.height
@@ -919,10 +919,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
         setStatus("")
         let content = window.contentView!
         content.layoutSubtreeIfNeeded()
+        fitToPicture(ci.extent.size, screenshot: true)        // as the app does when the camera starts
+        content.layoutSubtreeIfNeeded()
         preview.layout()
-        content.displayIfNeeded()
-        let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds)!
-        content.cacheDisplay(in: content.bounds, to: rep)
+        let frame = content.superview ?? content          // the whole window, its top bar with the tabs included
+        frame.layoutSubtreeIfNeeded(); frame.displayIfNeeded()
+        let rep = frame.bitmapImageRepForCachingDisplay(in: frame.bounds)!
+        frame.cacheDisplay(in: frame.bounds, to: rep)
         try! rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: out))
     }
 
@@ -1899,7 +1902,7 @@ enum CLI {
                 d.buildWindow(); d.window.setContentSize(NSSize(width: 560, height: 640))
                 d.showTab(1)
                 if args.count > 4 {
-                    d.createView.advancedButton.state = .on; d.createView.toggleAdvanced()
+                    if args.count > 6, args[6] == "advanced" { d.createView.advancedButton.state = .on; d.createView.toggleAdvanced() }
                     if let k = CodeKind(rawValue: args[4]) { d.createView.kindMenu.selectItem(at: CodeKind.allCases.firstIndex(of: k)!); d.createView.kindChanged() }
                     if args.count > 5, args[5].hasPrefix("wifi=") {
                         d.createView.contentMode.selectedSegment = 1; d.createView.modeChanged()
@@ -1907,7 +1910,7 @@ enum CLI {
                         d.createView.changed()
                     } else if args.count > 5 { d.createView.textView.string = args[5]; d.createView.changed() }
                 }
-                let view = d.window.contentView!
+                let view = d.window.contentView!.superview ?? d.window.contentView!
                 view.layoutSubtreeIfNeeded(); view.displayIfNeeded()
                 let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds)!
                 view.cacheDisplay(in: view.bounds, to: rep)
@@ -2622,8 +2625,11 @@ final class CreateView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
             basic.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -24),
             preview.heightAnchor.constraint(greaterThanOrEqualToConstant: 160),
         ])
-        preview.setContentHuggingPriority(.defaultLow, for: .vertical)
-        preview.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        // The preview shrinks to the window: left alone it asks for the PNG's full size, which made the window wide.
+        for o in [NSLayoutConstraint.Orientation.horizontal, .vertical] {
+            preview.setContentHuggingPriority(.defaultLow, for: o)
+            preview.setContentCompressionResistancePriority(.init(1), for: o)
+        }
         kindChanged()
     }
     required init?(coder: NSCoder) { fatalError() }

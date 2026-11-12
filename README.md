@@ -6,19 +6,30 @@ A tiny Mac app that reads QR codes and barcodes from any camera (the built-in on
 
 Apple Silicon · macOS 14+ · Signed and notarized
 
+## Scan
+
 ![ShenzhenQR reading a Wi-Fi QR code](docs/screenshot.png)
 
-- **Any camera.** Pick it from the menu at the top; ShenzhenQR remembers your choice and notices cameras being plugged in or removed. The menu beside it lists the picture sizes that camera has.
-- **Zoom for small codes.** Double-click the picture to zoom 2.5× into the middle, and again to zoom out, or use the zoom bar at the bottom of the picture. Only the middle is read then, closer up, so smaller codes are found.
-- **Every common code.** QR, Micro QR, Aztec, Data Matrix, PDF417, EAN and UPC, Code 128, 39 and 93, ITF, Codabar and GS1 DataBar.
-- **Photo and text.** **Photo** freezes the picture and reads the text in it, Chinese included: select text right on the photo, as in Preview, or edit all of it in the field below. Codes on the photo are outlined too; click one to put it in the field. **Back to Camera** returns.
-- **Blurred barcodes.** On a photo or a picture, when a barcode's bars are too blurred to read, its number is read from the digits printed under it, and kept only if its check digit is right (dashed outline). A camera can't focus up close: hold the code farther away and zoom in instead.
-- **See where it is.** A green outline marks each code where it was read. With several in view, click one to use it.
-- **Settings** (⌘,): the camera resolution, and how many processor cores read frames at the same time (4 unless you change it).
+- **Any camera.** Pick it from the menu at the top: the built-in one, a USB webcam, a virtual camera or an iPhone. ShenzhenQR remembers your choice and notices cameras being plugged in or removed. The menu beside it lists the picture sizes that camera has, and the window fits the camera's picture.
+- **Every common code.** QR, Micro QR, Aztec, Data Matrix, PDF417, EAN and UPC, Code 128, 39 and 93, ITF, Codabar and GS1 DataBar. A green outline marks each one; with several in view, click one to use it.
 - **The text, ready to use.** What the code holds appears in a field you can select and edit. **Copy** puts it on the clipboard.
 - **The right next step.** Depending on the code: **Join** a Wi-Fi network (or copy its password), **Open in Browser**, **Add to Contacts**, **Add to Calendar**, **Write Email**, **Call**, **Send Message** or **Show in Maps**. Buttons follow your edits.
-- **Make codes.** The **Create** tab at the top makes a QR code, Data Matrix, Aztec code, PDF417, Code 128, EAN-13, UPC-A or EAN-8 as a crisp PNG, saved in Downloads unless you choose another folder. Type and content are all it needs; **Advanced** has error correction, quiet zone, Data Matrix shape, bar height, the digits under EAN and UPC barcodes, colors, a transparent background and the file name, each with the standard value until you change it. For a QR code, **Wi-Fi network** makes a code that phones scan to join a network: type its name and password, or **Use Current Wi-Fi** to take this Mac's (macOS asks for Location, as it counts Wi-Fi names as location, then for your Mac's password before sharing the Wi-Fi password).
-- **Updates.** ShenzhenQR checks for a new version once a day and asks before installing it; **Check for Updates…** in the app menu checks now.
+- **Zoom for small codes.** Double-click the picture to zoom 2.5× into the middle, and again to zoom out, or use the zoom bar at the bottom of the picture. Only the middle is read then, closer up, so smaller codes are found.
+- **Photo and text.** **Photo** freezes the picture and reads the text in it, Chinese included: select text right on the photo, as in Preview, or edit all of it in the field below. Codes on the photo are outlined too; click one to put it in the field.
+- **Blurred barcodes.** On a photo or a picture, when a barcode's bars are too blurred to read, its number is read from the digits printed under it, and kept only if its check digit is right (dashed outline). A camera can't focus up close: hold the code farther away and zoom in instead.
+
+## Create
+
+![ShenzhenQR making a Wi-Fi QR code](docs/screenshot-create.png)
+
+- **Codes as PNG.** A QR code, Data Matrix, Aztec code, PDF417, Code 128, EAN-13, UPC-A or EAN-8, crisp at the width you ask for, saved in Downloads unless you choose another folder. **Copy Image** puts it on the clipboard.
+- **Wi-Fi codes.** For a QR code, **Wi-Fi network** makes a code that phones scan to join a network. Type its name and password, or click **Use Current Wi-Fi** to take this Mac's: macOS asks once for Location, as it counts Wi-Fi names as location, then for your Mac's password before sharing the Wi-Fi password.
+- **Advanced**, closed until you open it: error correction, quiet zone, Data Matrix shape, bar height, the digits under EAN and UPC barcodes, colors, a transparent background and the file name, each at the standard value until you change it.
+
+## Settings and updates
+
+- **Settings** (⌘,): the camera resolution, and how many processor cores read frames at the same time (4 unless you change it).
+- **Updates.** ShenzhenQR checks for a new version once a day and asks before installing it. **Check for Updates…** in the app menu checks now.
 
 ## Install
 
@@ -76,4 +87,4 @@ One Swift file, no dependencies:
 ./build.sh --release  # Developer ID signature, notarized app and disk image
 ```
 
-`make-icon.swift` draws the icon; `ShenzhenQR --screenshot <out.png> <picture>` draws the screenshot above.
+`make-icon.swift` draws the icon. `ShenzhenQR --screenshot <out.png> <picture>` draws the Scan screenshot above, from a picture standing in for the camera; `ShenzhenQR --screenshot <out.png> create qr "wifi=<network>"` draws the Create one.
