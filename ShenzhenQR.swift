@@ -935,14 +935,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
         AppDelegate.shared = self
         if Installer.offerMove() { return }
         Installer.ejectInstallerDisk()
-        buildWindow()
-        Updater.shared.start()
         scanner.onCodes = { [weak self] codes, size in self?.found(codes, size: size) }
         scanner.onSize = { [weak self] size in
             self?.frameSize = size; self?.refreshResolutionMenu()
             if self?.photoView == nil { self?.fitToPicture(size) }
         }
         scanner.region = { _ in zoomRegion(Settings.zoom) }
+        startCameraEarly()
+        buildWindow()
+        Updater.shared.start()
         preview.markers.onPick = { [weak self] d in self?.show(d) }
         preview.markers.onDoubleClick = { [weak self] in self?.setZoom(Settings.zoom > 1.05 ? 1 : 2.5) }
         preview.onZoom = { [weak self] z in self?.setZoom(z) }
@@ -967,6 +968,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { true }
+
+    /// The camera started before the window was built, until startCamera() takes it over.
+    var earlyCamera: AVCaptureDevice?
+    /// A camera takes about as long to give its first picture as the window takes to build, so the camera is started
+    /// first and both happen at once. Only when the app opens on the camera: not on a picture, not on Create, and not
+    /// before camera access is given.
+    func startCameraEarly() {
+        guard openAtLaunch == nil, Settings.defaults.integer(forKey: "tab") == 0,
+              AVCaptureDevice.authorizationStatus(for: .video) == .authorized else { return }
+        let found = Scanner.cameras()
+        guard let device = found.first(where: { $0.uniqueID == Settings.camera }) ?? found.first else { return }
+        earlyCamera = device
+        scanner.cores = Settings.cores
+        scanner.use(device, resolution: Settings.resolution)
+    }
 
     var cameraAsked = false
     /// Starts the camera, asking for access the first time. Not done while the app shows a picture it was opened on.
@@ -1269,7 +1285,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
         let i = cameraMenu.indexOfSelectedItem
         guard cameras.indices.contains(i) else { return }
         scanner.cores = Settings.cores
-        scanner.use(cameras[i], resolution: Settings.resolution)
+        let early = earlyCamera; earlyCamera = nil
+        if early?.uniqueID != cameras[i].uniqueID { scanner.use(cameras[i], resolution: Settings.resolution) }   // else it is starting already
         preview.markers.mirrored = preview.layerPreview.connection?.isVideoMirrored ?? false
     }
 
@@ -3633,6 +3650,8 @@ if args.count == 5, args[1] == "--post-update", let pid = pid_t(args[4]) {
 }
 if args.count > 1, CLI.commands.contains(args[1]) { CLI.main(args) }
 
+// The camera system takes a moment to answer the first time it is asked: ask now, while the menus are made.
+DispatchQueue.global(qos: .userInitiated).async { _ = Scanner.cameras() }
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
