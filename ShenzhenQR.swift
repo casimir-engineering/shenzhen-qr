@@ -928,7 +928,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
                                target: nil, action: nil)
     let openButton = NSButton(image: NSImage(systemSymbolName: "folder", accessibilityDescription: "Open Picture")!,
                               target: nil, action: nil)
-    var photoView: NSImageView?, photoOverlay: ImageAnalysisOverlayView?
+    var photoView: NSImageView?, photoOverlay: ImageAnalysisOverlayView?, photoImage: CGImage?
     var settingsWindow: SettingsWindow?
 
     func applicationDidFinishLaunching(_ n: Notification) {
@@ -1018,6 +1018,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
             return
         }
         showPicture(Picture.read(board), name: Picture.files(board).first?.lastPathComponent)
+    }
+
+    /// What ⌘C copies and ⌘S saves: the photo or picture showing in Scan, the code made in Create.
+    var shownImage: CGImage? {
+        guard window.attachedSheet == nil else { return nil }
+        return scanView.isHidden ? createView.current : photoImage
+    }
+
+    /// ⌘C: selected text is copied as usual, in a field or on the photo; with none selected, the image is.
+    @MainActor @objc func copyAnything(_ sender: Any?) {
+        let key = NSApp.keyWindow ?? window, field = key?.firstResponder as? NSTextView
+        if let field, field.selectedRange().length > 0 { field.copy(sender); return }
+        guard key === window else { NSApp.sendAction(#selector(NSText.copy(_:)), to: nil, from: sender); return }
+        if !scanView.isHidden, let overlay = photoOverlay, overlay.hasActiveTextSelection { Payload.copy(overlay.selectedText); return }
+        guard let image = shownImage else { NSApp.sendAction(#selector(NSText.copy(_:)), to: nil, from: sender); return }
+        if scanView.isHidden { createView.copyImage(); return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setData(pngData(image), forType: .png)
+        setStatus("\(photoNoun.capitalized) copied")
+    }
+
+    /// ⌘S: the photo or picture showing is saved where the person chooses, as PNG or JPEG; in Create, the code is
+    /// saved in its folder, as the Save button does.
+    @objc func saveAnything(_ sender: Any?) {
+        guard let image = shownImage else { return }
+        if scanView.isHidden { createView.save(); return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.png, .jpeg]
+        if #available(macOS 15, *) { panel.showsContentTypes = true }
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
+        panel.nameFieldStringValue = "\(photoNoun.capitalized) \(f.string(from: Date())).png"
+        panel.beginSheetModal(for: window) { answer in
+            guard answer == .OK, let url = panel.url else { return }
+            let jpeg = ["jpg", "jpeg"].contains(url.pathExtension.lowercased())
+            let data = NSBitmapImageRep(cgImage: image).representation(using: jpeg ? .jpeg : .png, properties: jpeg ? [.compressionFactor: 0.9] : [:])!
+            do {
+                try data.write(to: url)
+                self.setStatus("Saved “\(url.lastPathComponent)” in \(url.deletingLastPathComponent().lastPathComponent)")
+            } catch {
+                self.setStatus("Couldn’t save “\(url.lastPathComponent)”: \(error.localizedDescription)")
+            }
+        }
     }
 
     /// A picture that was pasted, dropped on the window or opened is read as a photo is: its codes are outlined and
@@ -1314,7 +1356,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
         view.addSubview(overlay)
         view.leaveDropsToWindow()
         preview.picture = view                  // places it, at no zoom
-        photoView = view; photoOverlay = overlay
+        photoView = view; photoOverlay = overlay; photoImage = image
         photoCodes = []; photoText = nil
         photoButton.title = "Back to Camera"
         photoButton.image = NSImage(systemSymbolName: "video", accessibilityDescription: nil)
@@ -1461,7 +1503,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
 
     func closePhoto() {
         photoOverlay?.removeFromSuperview(); photoView?.removeFromSuperview()
-        photoOverlay = nil; photoView = nil; photoCodes = []; photoText = nil; photoLines = []
+        photoOverlay = nil; photoView = nil; photoImage = nil; photoCodes = []; photoText = nil; photoLines = []
         preview.picture = nil
         let markers = preview.markers
         markers.detections = []; markers.passThrough = false; markers.zoom = preview.zoom
@@ -1561,10 +1603,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
 }
 
 extension AppDelegate: NSMenuItemValidation {
-    /// Paste: when the clipboard holds a picture, or there is a text field to paste into.
+    /// Paste: when the clipboard holds a picture, or there is a text field to paste into. Copy: when there is an
+    /// image to copy, or text. Save: when there is an image, named for what it saves.
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
-        guard item.action == #selector(pasteAnything(_:)) else { return true }
-        return Picture.holdsPicture(.general) || NSApp.target(forAction: #selector(NSText.paste(_:)), to: nil, from: item) != nil
+        switch item.action {
+        case #selector(pasteAnything(_:)):
+            return Picture.holdsPicture(.general) || NSApp.target(forAction: #selector(NSText.paste(_:)), to: nil, from: item) != nil
+        case #selector(copyAnything(_:)):
+            return shownImage != nil || NSApp.target(forAction: #selector(NSText.copy(_:)), to: nil, from: item) != nil
+        case #selector(saveAnything(_:)):
+            item.title = scanView.isHidden ? "Save Code" : "Save \(photoView == nil ? "Photo" : photoNoun.capitalized)…"
+            return shownImage != nil
+        default: return true
+        }
     }
 }
 
@@ -2967,7 +3018,7 @@ final class CreateView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
         scroll.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
 
         statusLabel.textColor = .secondaryLabelColor; statusLabel.lineBreakMode = .byTruncatingMiddle
-        saveButton.target = self; saveButton.action = #selector(save); saveButton.keyEquivalent = "s"; saveButton.keyEquivalentModifierMask = .command
+        saveButton.target = self; saveButton.action = #selector(save)      // ⌘S comes from File › Save
         copyButton.target = self; copyButton.action = #selector(copyImage)
         revealButton.target = self; revealButton.action = #selector(reveal); revealButton.isHidden = true
         let bottom = NSStackView(views: [statusLabel, revealButton, NSView(), copyButton, saveButton])
@@ -3606,9 +3657,13 @@ for (t, s, k) in [("Undo", "undo:", "z"), ("Redo", "redo:", "Z"), ("Cut", "cut:"
 // Paste reads a picture when the clipboard holds one, wherever the cursor is.
 let pasteItem = editMenu.item(withTitle: "Paste")!
 pasteItem.action = #selector(AppDelegate.pasteAnything(_:)); pasteItem.target = delegate
+// Copy copies the photo, the picture or the code made when no text is selected.
+let copyItem = editMenu.item(withTitle: "Copy")!
+copyItem.action = #selector(AppDelegate.copyAnything(_:)); copyItem.target = delegate
 editItem.submenu = editMenu
 let fileMenu = NSMenu(title: "File")
 fileMenu.addItem(withTitle: "Open Picture…", action: #selector(AppDelegate.openPicture), keyEquivalent: "o").target = delegate
+fileMenu.addItem(withTitle: "Save Photo…", action: #selector(AppDelegate.saveAnything(_:)), keyEquivalent: "s").target = delegate
 fileItem.submenu = fileMenu
 app.mainMenu = menu
 app.run()
