@@ -521,6 +521,7 @@ final class MarkerView: NSView {
     var imageSize = CGSize(width: 16, height: 9)
     var mirrored = false
     var zoom = 1.0 { didSet { needsDisplay = true } }
+    var offset = CGPoint.zero { didSet { needsDisplay = true } }      // a zoomed still picture, moved off the middle
     var onPick: ((Detection) -> Void)?
     var onDoubleClick: (() -> Void)?
 
@@ -536,7 +537,7 @@ final class MarkerView: NSView {
         let z = CGFloat(zoom), c = CGPoint(x: bounds.midX, y: bounds.midY)
         let points = d.corners.map { p in
             let q = CGPoint(x: r.minX + (mirrored ? 1 - p.x : p.x) * r.width, y: r.maxY - p.y * r.height)
-            return CGPoint(x: c.x + (q.x - c.x) * z, y: c.y + (q.y - c.y) * z)   // zoomed about the middle
+            return CGPoint(x: c.x + (q.x - c.x) * z + offset.x, y: c.y + (q.y - c.y) * z + offset.y)   // zoomed about the middle
         }
         let path = NSBezierPath()
         path.move(to: points[0]); points.dropFirst().forEach { path.line(to: $0) }; path.close()
@@ -637,6 +638,40 @@ final class PreviewView: NSView {
         ])
     }
 
+    /// A photo, or a picture pasted or opened, shown over the camera. It has its own zoom, about any point, and can
+    /// be moved once zoomed in. Its view is made bigger, not scaled: it draws the picture's own pixels, sharp.
+    weak var picture: NSView? {
+        didSet { pictureZoom = 1; pictureOffset = .zero; if picture == nil { markers.offset = .zero } else { placePicture() } }
+    }
+    private(set) var pictureZoom = 1.0, pictureOffset = CGPoint.zero
+    static let maxPictureZoom = 10.0
+
+    /// Zooms the picture, keeping what is at `p` (the pointer) where it is.
+    func zoomPicture(to zoom: Double, at p: CGPoint) {
+        let z = min(max(zoom, 1), Self.maxPictureZoom), k = CGFloat(z / pictureZoom)
+        let dx = p.x - bounds.midX, dy = p.y - bounds.midY
+        pictureOffset = CGPoint(x: dx - (dx - pictureOffset.x) * k, y: dy - (dy - pictureOffset.y) * k)
+        pictureZoom = z
+        placePicture()
+    }
+
+    func movePicture(dx: CGFloat, dy: CGFloat) {
+        pictureOffset.x += dx; pictureOffset.y += dy
+        placePicture()
+    }
+
+    func placePicture() {
+        guard let picture else { return }
+        let z = CGFloat(pictureZoom), fit = markers.fitRect()
+        // It moves as far as its own edges, and stays in the middle while it's smaller than the view.
+        let mx = max(0, (fit.width * z - bounds.width) / 2), my = max(0, (fit.height * z - bounds.height) / 2)
+        pictureOffset = CGPoint(x: min(max(pictureOffset.x, -mx), mx), y: min(max(pictureOffset.y, -my), my))
+        picture.frame = CGRect(x: bounds.midX - bounds.width * z / 2 + pictureOffset.x,
+                               y: bounds.midY - bounds.height * z / 2 + pictureOffset.y,
+                               width: bounds.width * z, height: bounds.height * z)
+        markers.zoom = pictureZoom; markers.offset = pictureOffset
+    }
+
     var onZoom: ((Double) -> Void)?
     @objc func slid() { onZoom?((zoomSlider.doubleValue * 10).rounded() / 10) }
     @objc func zoomIn() { onZoom?(min(Settings.maxZoom, (zoom * 2 + 0.001).rounded(.down) / 2 + 0.5)) }
@@ -649,6 +684,7 @@ final class PreviewView: NSView {
         layerPreview.position = CGPoint(x: bounds.midX, y: bounds.midY)
         markers.frame = bounds
         stillImage?.frame = bounds.insetBy(dx: -bounds.width * (zoom - 1) / 2, dy: -bounds.height * (zoom - 1) / 2)
+        placePicture()
     }
 }
 
@@ -913,6 +949,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
         preview.zoom = Settings.zoom
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard event.keyCode == 53, let self, MainActor.assumeIsolated({ self.escape(event) }) else { return event }
+            return nil
+        }
+        NSEvent.addLocalMonitorForEvents(matching: [.magnify, .smartMagnify, .scrollWheel]) { [weak self] event in
+            guard let self, MainActor.assumeIsolated({ self.zoomPicture(event) }) else { return event }
             return nil
         }
         NSApp.activate(ignoringOtherApps: true)
@@ -1264,8 +1304,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
         preview.layerPreview.isHidden = true
         let view = NSImageView(image: NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height)))
         view.imageScaling = .scaleProportionallyUpOrDown
-        view.frame = preview.bounds
-        view.autoresizingMask = [.width, .height]
         preview.addSubview(view, positioned: .below, relativeTo: markers)
         // Live Text, laid over the image view it tracks.
         let overlay = ImageAnalysisOverlayView()
@@ -1275,6 +1313,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
         overlay.autoresizingMask = [.width, .height]
         view.addSubview(overlay)
         view.leaveDropsToWindow()
+        preview.picture = view                  // places it, at no zoom
         photoView = view; photoOverlay = overlay
         photoCodes = []; photoText = nil
         photoButton.title = "Back to Camera"
@@ -1400,9 +1439,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
         return true
     }
 
+    /// Over a photo or picture: a pinch or ⌘-scroll zooms it where the pointer is, a two-finger double tap zooms in
+    /// and back out, and scrolling moves it once it's zoomed in. False when the event isn't for the picture.
+    @MainActor func zoomPicture(_ event: NSEvent) -> Bool {
+        guard photoView != nil, event.window === window, window.attachedSheet == nil, !scanView.isHidden else { return false }
+        let p = preview.convert(event.locationInWindow, from: nil), zoom = preview.pictureZoom
+        guard preview.bounds.contains(p) else { return false }
+        switch event.type {
+        case .magnify: preview.zoomPicture(to: zoom * (1 + event.magnification), at: p)
+        case .smartMagnify: preview.zoomPicture(to: zoom > 1.05 ? 1 : 2.5, at: p)
+        case .scrollWheel where event.modifierFlags.contains(.command):
+            // A trackpad gives points, a mouse wheel gives notches.
+            preview.zoomPicture(to: zoom * exp(event.scrollingDeltaY * (event.hasPreciseScrollingDeltas ? 0.01 : 0.1)), at: p)
+        case .scrollWheel where zoom > 1:
+            let k: CGFloat = event.hasPreciseScrollingDeltas ? 1 : 10
+            preview.movePicture(dx: event.scrollingDeltaX * k, dy: -event.scrollingDeltaY * k)
+        default: return false
+        }
+        return true
+    }
+
     func closePhoto() {
         photoOverlay?.removeFromSuperview(); photoView?.removeFromSuperview()
         photoOverlay = nil; photoView = nil; photoCodes = []; photoText = nil; photoLines = []
+        preview.picture = nil
         let markers = preview.markers
         markers.detections = []; markers.passThrough = false; markers.zoom = preview.zoom
         markers.mirrored = preview.layerPreview.connection?.isVideoMirrored ?? false
