@@ -781,6 +781,13 @@ enum Picture {
         CIImage(data: data, options: [.applyOrientationProperty: true]).flatMap { cgImage($0, region: nil) }
     }
 
+    /// Whether the clipboard may hold a picture, from the names of its types alone. macOS lets an app look at those
+    /// at any time, but asks the person (or refuses) before an app reads what was copied, except during a paste:
+    /// menus use this, and the paste itself reads.
+    static func mayHoldPicture(_ board: NSPasteboard) -> Bool {
+        (board.types ?? []).contains { $0 == .fileURL || isPicture($0) }
+    }
+
     /// Whether the clipboard or a drag holds a picture: a picture file, or a picture itself. Looks at types only.
     /// A copied file also carries its icon, which isn't what was copied: with files, only they count.
     static func holdsPicture(_ board: NSPasteboard) -> Bool {
@@ -1025,12 +1032,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
         }
     }
 
-    /// ⌘V: a picture on the clipboard is read; anything else is pasted where the cursor is, as usual.
-    @MainActor @objc func pasteAnything(_ sender: Any?) {
+    /// ⌘V: a picture on the clipboard is read; anything else is pasted where the cursor is, as usual. The action is
+    /// the standard paste: so macOS counts the clipboard read as a paste the person asked for and lets it through
+    /// (a read under any other action can be refused, or make macOS ask, depending on the app's Paste setting).
+    @MainActor @objc func paste(_ sender: Any?) {
         let board = NSPasteboard.general
-        let intoText = (NSApp.keyWindow?.firstResponder as? NSTextView)?.isEditable == true
+        let field = NSApp.keyWindow?.firstResponder as? NSTextView
+        let intoText = field?.isEditable == true
         guard Picture.pastesAsPicture(board, intoText: intoText) else {
-            NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: sender)
+            if let field, intoText { field.paste(sender) }
             return
         }
         showPicture(Picture.read(board), name: Picture.files(board).first?.lastPathComponent)
@@ -1624,8 +1634,10 @@ extension AppDelegate: NSMenuItemValidation {
     /// image to copy, or text. Save: when there is an image, named for what it saves.
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
         switch item.action {
-        case #selector(pasteAnything(_:)):
-            return Picture.holdsPicture(.general) || NSApp.target(forAction: #selector(NSText.paste(_:)), to: nil, from: item) != nil
+        case #selector(paste(_:)):
+            // Types only: reading what was copied here, outside a paste, is what macOS guards.
+            let field = NSApp.keyWindow?.firstResponder as? NSTextView
+            return Picture.mayHoldPicture(.general) || field?.isEditable == true
         case #selector(copyAnything(_:)):
             return shownImage != nil || NSApp.target(forAction: #selector(NSText.copy(_:)), to: nil, from: item) != nil
         case #selector(saveAnything(_:)):
@@ -3675,7 +3687,7 @@ for (t, s, k) in [("Undo", "undo:", "z"), ("Redo", "redo:", "Z"), ("Cut", "cut:"
 }
 // Paste reads a picture when the clipboard holds one, wherever the cursor is.
 let pasteItem = editMenu.item(withTitle: "Paste")!
-pasteItem.action = #selector(AppDelegate.pasteAnything(_:)); pasteItem.target = delegate
+pasteItem.action = #selector(AppDelegate.paste(_:)); pasteItem.target = delegate
 // Copy copies the photo, the picture or the code made when no text is selected.
 let copyItem = editMenu.item(withTitle: "Copy")!
 copyItem.action = #selector(AppDelegate.copyAnything(_:)); copyItem.target = delegate
