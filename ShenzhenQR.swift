@@ -1021,6 +1021,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate, NS
     }
 
     /// File › Open Picture…
+    /// ⌘W: closes Settings when it is in front; the scanner is the app's only real window, so closing it quits.
+    @MainActor @objc func closeWindow(_ sender: Any?) {
+        if let key = NSApp.keyWindow, key !== window { key.performClose(sender) } else { NSApp.terminate(sender) }
+    }
+
     @MainActor @objc func openPicture() {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.image]
@@ -3695,6 +3700,8 @@ editItem.submenu = editMenu
 let fileMenu = NSMenu(title: "File")
 fileMenu.addItem(withTitle: "Open Picture…", action: #selector(AppDelegate.openPicture), keyEquivalent: "o").target = delegate
 fileMenu.addItem(withTitle: "Save Photo…", action: #selector(AppDelegate.saveAnything(_:)), keyEquivalent: "s").target = delegate
+fileMenu.addItem(.separator())
+fileMenu.addItem(withTitle: "Close Window", action: #selector(AppDelegate.closeWindow(_:)), keyEquivalent: "w").target = delegate
 fileItem.submenu = fileMenu
 app.mainMenu = menu
 app.run()
